@@ -33,14 +33,23 @@ CLI storage format is internal and may change in future Codex releases.
 - Xcode 26 or later, or a compatible Xcode toolchain
 - Existing local Codex CLI sessions under `~/.codex`
 
-## Build And Run
+## Install
+
+```bash
+Scripts/install-app.sh
+```
+
+This builds the app, installs it to `/Applications/Codex CLI Log.app`, and opens
+it.
+
+## Build Without Installing
 
 ```bash
 xcodebuild -project CodexLogApp.xcodeproj -scheme "Codex CLI Log" -configuration Debug -destination 'platform=macOS' build
-open ~/Library/Developer/Xcode/DerivedData/CodexLogApp-*/Build/Products/Debug/Codex\ CLI\ Log.app
 ```
 
-Or open `CodexLogApp.xcodeproj` in Xcode and run the `Codex CLI Log` scheme.
+You can also open `CodexLogApp.xcodeproj` in Xcode and run the `Codex CLI Log`
+scheme.
 
 ## App Icon
 
