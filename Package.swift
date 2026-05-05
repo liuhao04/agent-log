@@ -3,13 +3,13 @@
 import PackageDescription
 
 let package = Package(
-    name: "CodexLogApp",
+    name: "AiCliLogApp",
     platforms: [
         .macOS(.v14)
     ],
     targets: [
         .executableTarget(
-            name: "CodexLogApp",
+            name: "AiCliLogApp",
             dependencies: ["CSQLite"]
         ),
         .systemLibrary(
