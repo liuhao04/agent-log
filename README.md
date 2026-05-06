@@ -1,5 +1,7 @@
 # AiCliLog
 
+[中文说明](README.zh-CN.md)
+
 A native macOS app for browsing local Codex CLI and Claude Code conversation logs.
 
 AiCliLog reads your local Codex CLI and Claude Code history, groups
@@ -33,7 +35,7 @@ faster way to revisit previous project conversations.
 
 - Browse Codex CLI and Claude Code sessions by project.
 - View clean conversations without tool calls, token events, or internal records.
-- Fold and expand a session by user query.
+- Fold and expand a session by user query, collapsed by default.
 - Search across projects and sessions, then jump to highlighted matches.
 - Filter cross-project search results by source and project.
 - Check the running app version in the window header and menu bar.

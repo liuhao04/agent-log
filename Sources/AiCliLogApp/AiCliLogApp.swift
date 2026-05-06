@@ -1570,7 +1570,7 @@ final class AppModel: ObservableObject {
         if !snapshot.knownClaudeSessions.isEmpty {
             knownClaudeSessions = snapshot.knownClaudeSessions
         }
-        expandedQueryIDs = Set(queryGroups.map(\.id))
+        expandedQueryIDs = []
         clearActiveSearchTarget()
     }
 
@@ -1579,14 +1579,14 @@ final class AppModel: ObservableObject {
         sessions = snapshot.sessions
         selectedSession = snapshot.selectedSession
         messages = snapshot.messages
-        expandedQueryIDs = Set(queryGroups.map(\.id))
+        expandedQueryIDs = []
         clearActiveSearchTarget()
     }
 
     private func apply(_ snapshot: MessageSnapshot) {
         selectedSession = snapshot.session
         messages = snapshot.messages
-        expandedQueryIDs = Set(queryGroups.map(\.id))
+        expandedQueryIDs = []
         clearActiveSearchTarget()
     }
 
