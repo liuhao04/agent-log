@@ -277,8 +277,8 @@
 					"$(inherited)",
 					"@executable_path/../Frameworks",
 					);
-						CURRENT_PROJECT_VERSION = 22;
-						MARKETING_VERSION = 0.5.6;
+						CURRENT_PROJECT_VERSION = 33;
+						MARKETING_VERSION = 0.6.7;
 				OTHER_LDFLAGS = (
 					"$(inherited)",
 					"-lsqlite3",
@@ -309,8 +309,8 @@
 					"$(inherited)",
 					"@executable_path/../Frameworks",
 					);
-						CURRENT_PROJECT_VERSION = 22;
-						MARKETING_VERSION = 0.5.6;
+						CURRENT_PROJECT_VERSION = 33;
+						MARKETING_VERSION = 0.6.7;
 				OTHER_LDFLAGS = (
 					"$(inherited)",
 					"-lsqlite3",

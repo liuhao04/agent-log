@@ -66,8 +66,14 @@ struct CleanMessage: Identifiable, Hashable, Sendable {
     let message: String
 }
 
+enum QueryGroupKind: Hashable, Sendable {
+    case query
+    case meta
+}
+
 struct QueryGroup: Identifiable, Hashable, Sendable {
     let id: String
+    let kind: QueryGroupKind
     let query: CleanMessage
     let responses: [CleanMessage]
 
@@ -351,12 +357,23 @@ final class ClaudeStore {
 
     func allSessions() throws -> [CodexSession] {
         var sessions: [CodexSession] = []
+        let cache = ClaudeSummaryCache.shared
+        var seenPaths: Set<String> = []
         for file in try sessionFiles() {
             try Task.checkCancellation()
-            if let session = sessionSummary(for: file) {
-                sessions.append(session)
+            seenPaths.insert(file.path)
+            let attrs = try? FileManager.default.attributesOfItem(atPath: file.path)
+            let mtime = (attrs?[.modificationDate] as? Date) ?? .distantPast
+            let size = (attrs?[.size] as? NSNumber)?.int64Value ?? 0
+            if let cached = cache.lookup(path: file.path, mtime: mtime, size: size) {
+                if let session = cached { sessions.append(session) }
+                continue
             }
+            let session = sessionSummary(for: file)
+            cache.store(path: file.path, mtime: mtime, size: size, session: session)
+            if let session { sessions.append(session) }
         }
+        cache.evict(keeping: seenPaths)
         return sessions
     }
 
@@ -370,16 +387,17 @@ final class ClaudeStore {
                 guard
                     let data = String(line).data(using: .utf8),
                     let event = try? decoder.decode(ClaudeEvent.self, from: data),
-                    let speaker = speaker(for: event),
+                    let baseSpeaker = speaker(for: event),
                     let message = cleanClaudeMessage(event.message?.content),
                     !message.isEmpty
                 else {
                     return nil
                 }
+                let resolvedSpeaker = (baseSpeaker == "You" && isClaudeMetaUserMessage(message)) ? "System" : baseSpeaker
                 return CleanMessage(
                     id: "\(session.id):\(lineNumber)",
                     timestamp: parseISO8601(event.timestamp),
-                    speaker: speaker,
+                    speaker: resolvedSpeaker,
                     message: message
                 )
             }
@@ -409,14 +427,18 @@ final class ClaudeStore {
     }
 
     private func sessionSummary(for url: URL) -> CodexSession? {
-        guard let text = readSummaryPrefix(url), !text.isEmpty else {
+        let prefixText = readSummaryPrefix(url) ?? ""
+        let tailText = readSummarySuffix(url, skipping: prefixText.utf8.count)
+        let text = prefixText.isEmpty ? tailText : (tailText.isEmpty ? prefixText : prefixText + "\n" + tailText)
+        guard !text.isEmpty else {
             return nil
         }
 
         let decoder = JSONDecoder()
         var cwd: String?
         var sessionID = url.deletingPathExtension().lastPathComponent
-        var title: String?
+        var firstQueryTitle: String?
+        var renameTitle: String?
         var updatedAt = fileModificationDate(url)
         var gitBranch = ""
 
@@ -435,13 +457,24 @@ final class ClaudeStore {
             if let timestamp = event.timestamp.flatMap(parseISO8601) {
                 updatedAt = max(updatedAt ?? .distantPast, timestamp)
             }
-            if title == nil,
-               event.type == "user",
-               let message = cleanClaudeMessage(event.message?.content),
-               !message.isEmpty {
-                title = message.replacingOccurrences(of: "\n", with: " ")
+            guard event.type == "user",
+                  let message = cleanClaudeMessage(event.message?.content),
+                  !message.isEmpty
+            else {
+                continue
+            }
+            if isClaudeMetaUserMessage(message) {
+                if let renamed = extractClaudeRenameTitle(message) {
+                    renameTitle = renamed
+                }
+                continue
+            }
+            if firstQueryTitle == nil {
+                firstQueryTitle = message.replacingOccurrences(of: "\n", with: " ")
             }
         }
+
+        let title = renameTitle ?? firstQueryTitle
 
         guard let cwd else {
             return nil
@@ -470,6 +503,30 @@ final class ClaudeStore {
             return nil
         }
         return String(data: data, encoding: .utf8)
+    }
+
+    private func readSummarySuffix(_ url: URL, skipping prefixBytes: Int) -> String {
+        let attrs = try? FileManager.default.attributesOfItem(atPath: url.path)
+        let fileSize = (attrs?[.size] as? NSNumber)?.intValue ?? 0
+        guard fileSize > prefixBytes else { return "" }
+        guard let handle = try? FileHandle(forReadingFrom: url) else { return "" }
+        defer { try? handle.close() }
+        let tailLimit = summaryReadLimit
+        let offset = max(prefixBytes, fileSize - tailLimit)
+        do {
+            try handle.seek(toOffset: UInt64(offset))
+        } catch {
+            return ""
+        }
+        guard let data = try? handle.read(upToCount: fileSize - offset), !data.isEmpty else {
+            return ""
+        }
+        guard let raw = String(data: data, encoding: .utf8) else { return "" }
+        // discard the first (possibly partial) line so JSON parse doesn't fail mid-record
+        if let nl = raw.firstIndex(of: "\n") {
+            return String(raw[raw.index(after: nl)...])
+        }
+        return ""
     }
 }
 
@@ -1085,6 +1142,53 @@ private func speaker(for event: ClaudeEvent) -> String? {
     }
 }
 
+private let claudeMetaUserTags: Set<String> = [
+    "local-command-caveat",
+    "command-name",
+    "command-message",
+    "command-args",
+    "command-stdout",
+    "command-stderr",
+    "local-command-stdout",
+    "local-command-stderr",
+    "bash-input",
+    "bash-stdout",
+    "bash-stderr",
+    "system-reminder"
+]
+
+private func isClaudeMetaUserMessage(_ text: String) -> Bool {
+    let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard trimmed.hasPrefix("<"), let tagEnd = trimmed.firstIndex(of: ">") else {
+        return false
+    }
+    let inner = trimmed[trimmed.index(after: trimmed.startIndex)..<tagEnd]
+    let tag = inner.split(separator: " ", maxSplits: 1).first.map(String.init) ?? String(inner)
+    return claudeMetaUserTags.contains(tag)
+}
+
+private func extractClaudeRenameTitle(_ text: String) -> String? {
+    guard text.contains("named this session") else {
+        return nil
+    }
+    guard let regex = try? NSRegularExpression(
+        pattern: #"named this session\s+"([^"]+)""#,
+        options: []
+    ) else {
+        return nil
+    }
+    let range = NSRange(text.startIndex..<text.endIndex, in: text)
+    guard
+        let match = regex.firstMatch(in: text, options: [], range: range),
+        match.numberOfRanges >= 2,
+        let captured = Range(match.range(at: 1), in: text)
+    else {
+        return nil
+    }
+    let title = text[captured].trimmingCharacters(in: .whitespacesAndNewlines)
+    return title.isEmpty ? nil : title
+}
+
 private func cleanClaudeMessage(_ content: JSONValue?) -> String? {
     guard let content else {
         return nil
@@ -1156,17 +1260,35 @@ private func buildQueryGroups(from messages: [CleanMessage]) -> [QueryGroup] {
     var groups: [QueryGroup] = []
     var currentQuery: CleanMessage?
     var currentResponses: [CleanMessage] = []
+    var pendingMeta: [CleanMessage] = []
 
-    func flush() {
-        guard let query = currentQuery else {
-            return
-        }
-        groups.append(QueryGroup(id: query.id, query: query, responses: currentResponses))
+    func flushQuery() {
+        guard let query = currentQuery else { return }
+        groups.append(QueryGroup(id: query.id, kind: .query, query: query, responses: currentResponses))
+        currentQuery = nil
+        currentResponses = []
+    }
+
+    func flushMeta() {
+        guard let first = pendingMeta.first else { return }
+        let label = CleanMessage(
+            id: "\(first.id):meta",
+            timestamp: first.timestamp,
+            speaker: "System",
+            message: "系统消息 × \(pendingMeta.count)"
+        )
+        groups.append(QueryGroup(id: label.id, kind: .meta, query: label, responses: pendingMeta))
+        pendingMeta = []
     }
 
     for message in messages {
+        if message.speaker == "System" {
+            pendingMeta.append(message)
+            continue
+        }
+        flushMeta()
         if message.speaker == "You" {
-            flush()
+            flushQuery()
             currentQuery = message
             currentResponses = []
         } else if currentQuery == nil {
@@ -1181,8 +1303,158 @@ private func buildQueryGroups(from messages: [CleanMessage]) -> [QueryGroup] {
             currentResponses.append(message)
         }
     }
-    flush()
+    flushQuery()
+    flushMeta()
     return groups
+}
+
+final class ClaudeSummaryCache: @unchecked Sendable {
+    static let shared = ClaudeSummaryCache()
+    private struct Entry {
+        let mtime: Date
+        let size: Int64
+        let session: CodexSession?
+    }
+    private var entries: [String: Entry] = [:]
+    private let lock = NSLock()
+
+    func lookup(path: String, mtime: Date, size: Int64) -> CodexSession?? {
+        lock.lock(); defer { lock.unlock() }
+        guard let e = entries[path], e.mtime == mtime, e.size == size else { return nil }
+        return .some(e.session)
+    }
+
+    func store(path: String, mtime: Date, size: Int64, session: CodexSession?) {
+        lock.lock(); defer { lock.unlock() }
+        entries[path] = Entry(mtime: mtime, size: size, session: session)
+    }
+
+    func evict(keeping paths: Set<String>) {
+        lock.lock(); defer { lock.unlock() }
+        entries = entries.filter { paths.contains($0.key) }
+    }
+
+    func invalidate(path: String) {
+        lock.lock(); defer { lock.unlock() }
+        entries.removeValue(forKey: path)
+    }
+}
+
+final class FileSystemWatcher {
+    private var stream: FSEventStreamRef?
+    private let queue = DispatchQueue(label: "io.github.aiclilog.fswatch")
+    var onChange: (([String]) -> Void)?
+
+    func start(paths: [String]) {
+        stop()
+        let existing = paths.filter { FileManager.default.fileExists(atPath: $0) }
+        guard !existing.isEmpty else { return }
+        var context = FSEventStreamContext(
+            version: 0,
+            info: Unmanaged.passUnretained(self).toOpaque(),
+            retain: nil,
+            release: nil,
+            copyDescription: nil
+        )
+        let flags = UInt32(
+            kFSEventStreamCreateFlagFileEvents
+            | kFSEventStreamCreateFlagNoDefer
+            | kFSEventStreamCreateFlagUseCFTypes
+        )
+        let callback: FSEventStreamCallback = { _, info, count, paths, _, _ in
+            guard let info else { return }
+            let watcher = Unmanaged<FileSystemWatcher>.fromOpaque(info).takeUnretainedValue()
+            guard let array = unsafeBitCast(paths, to: NSArray.self) as? [String] else { return }
+            let slice = Array(array.prefix(Int(count)))
+            watcher.onChange?(slice)
+        }
+        guard let stream = FSEventStreamCreate(
+            kCFAllocatorDefault,
+            callback,
+            &context,
+            existing as CFArray,
+            FSEventStreamEventId(kFSEventStreamEventIdSinceNow),
+            1.0,
+            flags
+        ) else { return }
+        FSEventStreamSetDispatchQueue(stream, queue)
+        FSEventStreamStart(stream)
+        self.stream = stream
+    }
+
+    func stop() {
+        if let stream {
+            FSEventStreamStop(stream)
+            FSEventStreamInvalidate(stream)
+            FSEventStreamRelease(stream)
+            self.stream = nil
+        }
+    }
+
+    deinit { stop() }
+}
+
+final class EventIntervalLogger: @unchecked Sendable {
+    private let url: URL
+    private var lastEventAt: Date?
+    private let lock = NSLock()
+    private let isoFormatter: ISO8601DateFormatter = {
+        let f = ISO8601DateFormatter()
+        f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return f
+    }()
+
+    init() {
+        let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
+            ?? FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support")
+        let dir = base.appendingPathComponent("AiCliLogApp", isDirectory: true)
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        self.url = dir.appendingPathComponent("fs-event-intervals.jsonl")
+    }
+
+    func recordEvent(source: String, pathCount: Int, samplePaths: [String] = []) {
+        let now = Date()
+        let interval: Double?
+        lock.lock()
+        if let last = lastEventAt {
+            interval = now.timeIntervalSince(last)
+        } else {
+            interval = nil
+        }
+        lastEventAt = now
+        lock.unlock()
+        append([
+            "ts": isoFormatter.string(from: now),
+            "kind": "event",
+            "source": source,
+            "paths": pathCount,
+            "samplePaths": samplePaths,
+            "intervalSec": interval as Any
+        ])
+    }
+
+    func recordReload(triggerCount: Int, windowSec: Double) {
+        append([
+            "ts": isoFormatter.string(from: Date()),
+            "kind": "reload",
+            "triggerCount": triggerCount,
+            "windowSec": windowSec
+        ])
+    }
+
+    private func append(_ dict: [String: Any]) {
+        guard let data = try? JSONSerialization.data(withJSONObject: dict, options: [.fragmentsAllowed]) else { return }
+        var line = data
+        line.append(0x0A)
+        lock.lock(); defer { lock.unlock() }
+        if let handle = try? FileHandle(forWritingTo: url) {
+            defer { try? handle.close() }
+            _ = try? handle.seekToEnd()
+            try? handle.write(contentsOf: line)
+        } else {
+            try? line.write(to: url, options: .atomic)
+        }
+    }
 }
 
 @MainActor
@@ -1213,6 +1485,9 @@ final class AppModel: ObservableObject {
     @Published var activeSearchGroupID: String?
     @Published var activeSearchMessageID: String?
     @Published var pendingSearchMessageID: String?
+    @Published var pendingScrollEdge: ScrollEdge?
+
+    enum ScrollEdge { case top, bottom }
 
     private var knownClaudeSessions: [CodexSession] = []
     private var loadTask: Task<Void, Never>?
@@ -1221,6 +1496,13 @@ final class AppModel: ObservableObject {
     private var searchTask: Task<Void, Never>?
     private var searchIndexTask: Task<Void, Never>?
     private let searchResultLimit = 500
+
+    private let fsWatcher = FileSystemWatcher()
+    private let intervalLogger = EventIntervalLogger()
+    private var debounceTask: Task<Void, Never>?
+    private var pendingChangeCount: Int = 0
+    private var watcherStarted = false
+    private let debounceWindow: Double = 10.0
 
     private struct LoadSnapshot: Sendable {
         let projects: [ProjectSummary]
@@ -1304,42 +1586,22 @@ final class AppModel: ObservableObject {
 
         loadTask = Task { [weak self, preferredProjectPath, preferredSessionID] in
             do {
-                let codexJob = Task.detached(priority: .userInitiated) {
+                let job = Task.detached(priority: .userInitiated) {
                     try Self.loadSnapshot(
                         preferredProjectPath: preferredProjectPath,
                         preferredSessionID: preferredSessionID,
-                        includeClaude: false
-                    )
-                }
-                let codexSnapshot = try await withTaskCancellationHandler {
-                    try await codexJob.value
-                } onCancel: {
-                    codexJob.cancel()
-                }
-                guard !Task.isCancelled else {
-                    return
-                }
-                self?.apply(codexSnapshot)
-                self?.updateSearchResults()
-
-                let currentProjectPath = self?.selectedProject?.cwd ?? preferredProjectPath
-                let currentSessionID = self?.selectedSession?.id ?? preferredSessionID
-                let fullJob = Task.detached(priority: .utility) {
-                    try Self.loadSnapshot(
-                        preferredProjectPath: currentProjectPath,
-                        preferredSessionID: currentSessionID,
                         includeClaude: true
                     )
                 }
-                let fullSnapshot = try await withTaskCancellationHandler {
-                    try await fullJob.value
+                let snapshot = try await withTaskCancellationHandler {
+                    try await job.value
                 } onCancel: {
-                    fullJob.cancel()
+                    job.cancel()
                 }
                 guard !Task.isCancelled else {
                     return
                 }
-                self?.apply(fullSnapshot)
+                self?.apply(snapshot)
                 self?.isLoading = false
                 self?.refreshSearchIndexInBackground()
                 self?.updateSearchResults()
@@ -1350,6 +1612,67 @@ final class AppModel: ObservableObject {
                 }
                 self?.errorMessage = error.localizedDescription
                 self?.isLoading = false
+            }
+        }
+    }
+
+    func startWatchingIfNeeded() {
+        guard !watcherStarted else { return }
+        watcherStarted = true
+        let home = FileManager.default.homeDirectoryForCurrentUser
+        let codexDir = home.appendingPathComponent(".codex").path
+        let claudeProjects = home.appendingPathComponent(".claude/projects").path
+        fsWatcher.onChange = { [weak self] paths in
+            Task { @MainActor [weak self] in
+                self?.handleFileSystemChange(paths: paths)
+            }
+        }
+        fsWatcher.start(paths: [codexDir, claudeProjects])
+    }
+
+    private func handleFileSystemChange(paths: [String]) {
+        intervalLogger.recordEvent(
+            source: "raw",
+            pathCount: paths.count,
+            samplePaths: Array(paths.prefix(10))
+        )
+        // Only `.jsonl` log files matter. FSEvents on the watched directories
+        // also fire for `.DS_Store`, lockfiles, directory mtime bumps, etc.
+        // — those should not trigger a reload that jumps the user's selection.
+        let logPaths = paths.filter { $0.hasSuffix(".jsonl") }
+        guard !logPaths.isEmpty else { return }
+        let source: String
+        if logPaths.contains(where: { $0.contains("/.codex") }) && logPaths.contains(where: { $0.contains("/.claude/") }) {
+            source = "mixed"
+        } else if logPaths.contains(where: { $0.contains("/.codex") }) {
+            source = "codex"
+        } else {
+            source = "claude"
+        }
+        intervalLogger.recordEvent(
+            source: source,
+            pathCount: logPaths.count,
+            samplePaths: Array(logPaths.prefix(5))
+        )
+        for path in logPaths {
+            ClaudeSummaryCache.shared.invalidate(path: path)
+        }
+        pendingChangeCount += 1
+        scheduleDebouncedReload()
+    }
+
+    private func scheduleDebouncedReload() {
+        debounceTask?.cancel()
+        let window = debounceWindow
+        debounceTask = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: UInt64(window * 1_000_000_000))
+            guard !Task.isCancelled else { return }
+            await MainActor.run {
+                guard let self else { return }
+                let count = self.pendingChangeCount
+                self.pendingChangeCount = 0
+                self.intervalLogger.recordReload(triggerCount: count, windowSec: window)
+                self.load()
             }
         }
     }
@@ -1368,37 +1691,23 @@ final class AppModel: ObservableObject {
 
         sessionTask = Task { [weak self, project] in
             do {
-                let codexJob = Task.detached(priority: .userInitiated) {
-                    try Self.sessionSnapshot(project: project, preferredSessionID: nil, includeClaude: false)
-                }
-                let codexSnapshot = try await withTaskCancellationHandler {
-                    try await codexJob.value
-                } onCancel: {
-                    codexJob.cancel()
-                }
-                guard !Task.isCancelled else {
-                    return
-                }
-                self?.apply(codexSnapshot)
-
-                let currentSessionID = self?.selectedSession?.id
-                let fullJob = Task.detached(priority: .utility) {
+                let job = Task.detached(priority: .userInitiated) {
                     try Self.sessionSnapshot(
                         project: project,
-                        preferredSessionID: currentSessionID,
+                        preferredSessionID: nil,
                         includeClaude: true,
                         knownClaudeSessions: cachedClaudeSessions
                     )
                 }
-                let fullSnapshot = try await withTaskCancellationHandler {
-                    try await fullJob.value
+                let snapshot = try await withTaskCancellationHandler {
+                    try await job.value
                 } onCancel: {
-                    fullJob.cancel()
+                    job.cancel()
                 }
                 guard !Task.isCancelled else {
                     return
                 }
-                self?.apply(fullSnapshot)
+                self?.apply(snapshot)
                 self?.isLoading = false
             } catch is CancellationError {
             } catch {
@@ -1562,6 +1871,7 @@ final class AppModel: ObservableObject {
     }
 
     private func apply(_ snapshot: LoadSnapshot) {
+        let previousSessionID = selectedSession?.id
         projects = snapshot.projects
         selectedProject = snapshot.selectedProject
         sessions = snapshot.sessions
@@ -1570,24 +1880,36 @@ final class AppModel: ObservableObject {
         if !snapshot.knownClaudeSessions.isEmpty {
             knownClaudeSessions = snapshot.knownClaudeSessions
         }
-        expandedQueryIDs = []
+        reconcileExpandedQueryIDs(previousSessionID: previousSessionID)
         clearActiveSearchTarget()
     }
 
     private func apply(_ snapshot: SessionSnapshot) {
+        let previousSessionID = selectedSession?.id
         selectedProject = snapshot.project
         sessions = snapshot.sessions
         selectedSession = snapshot.selectedSession
         messages = snapshot.messages
-        expandedQueryIDs = []
+        reconcileExpandedQueryIDs(previousSessionID: previousSessionID)
         clearActiveSearchTarget()
     }
 
     private func apply(_ snapshot: MessageSnapshot) {
+        let previousSessionID = selectedSession?.id
         selectedSession = snapshot.session
         messages = snapshot.messages
-        expandedQueryIDs = []
+        reconcileExpandedQueryIDs(previousSessionID: previousSessionID)
         clearActiveSearchTarget()
+    }
+
+    private func reconcileExpandedQueryIDs(previousSessionID: String?) {
+        if selectedSession?.id != previousSessionID {
+            expandedQueryIDs = []
+            return
+        }
+        guard !expandedQueryIDs.isEmpty else { return }
+        let liveIDs = Set(queryGroups.map(\.id))
+        expandedQueryIDs.formIntersection(liveIDs)
     }
 
     private nonisolated static func loadSnapshot(
@@ -1921,6 +2243,7 @@ struct ContentView: View {
         .frame(minWidth: 1100, minHeight: 680)
         .task {
             model.load()
+            model.startWatchingIfNeeded()
         }
         .alert("AiCliLog", isPresented: Binding(
             get: { model.errorMessage != nil },
@@ -1937,10 +2260,10 @@ struct ProjectListView: View {
     @ObservedObject var model: AppModel
 
     var body: some View {
-        List(model.projects, selection: Binding(
-            get: { model.selectedProject },
-            set: { project in
-                if let project {
+        List(model.projects, selection: Binding<String?>(
+            get: { model.selectedProject?.id },
+            set: { id in
+                if let id, let project = model.projects.first(where: { $0.id == id }) {
                     model.loadSessions(for: project)
                 }
             }
@@ -1963,20 +2286,35 @@ struct ProjectListView: View {
                 .foregroundStyle(.secondary)
             }
             .padding(.vertical, 4)
-            .tag(project)
+            .tag(project.id)
         }
         .navigationTitle("Projects")
         .toolbar {
-            if model.isLoading {
-                ProgressView()
-                    .controlSize(.small)
-            }
             Button {
                 model.load()
             } label: {
-                Label("Refresh", systemImage: "arrow.clockwise")
+                if model.isLoading {
+                    ProgressView()
+                        .controlSize(.small)
+                } else {
+                    Label("Refresh", systemImage: "arrow.clockwise")
+                }
             }
             .disabled(model.isLoading)
+        }
+        .safeAreaInset(edge: .bottom, spacing: 0) {
+            VStack(spacing: 0) {
+                Divider()
+                HStack {
+                    Text(model.appVersionLabel)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    Spacer()
+                }
+                .padding(.horizontal, 12)
+                .padding(.vertical, 8)
+            }
+            .background(.bar)
         }
     }
 }
@@ -1985,10 +2323,14 @@ struct SessionListView: View {
     @ObservedObject var model: AppModel
 
     var body: some View {
-        List(model.sessions, selection: Binding(
-            get: { model.selectedSession },
-            set: { session in
-                if let session {
+        // Bind selection by stable ID, not the whole struct. CodexSession's
+        // Hashable includes `updatedAt`, which changes whenever the underlying
+        // jsonl is appended — that would otherwise make SwiftUI think the
+        // current selection has disappeared and jump it to another row.
+        List(model.sessions, selection: Binding<String?>(
+            get: { model.selectedSession?.id },
+            set: { id in
+                if let id, let session = model.sessions.first(where: { $0.id == id }) {
                     model.loadMessages(for: session)
                 }
             }
@@ -2014,7 +2356,7 @@ struct SessionListView: View {
                     .foregroundStyle(.secondary)
             }
             .padding(.vertical, 5)
-            .tag(session)
+            .tag(session.id)
         }
         .navigationTitle(model.selectedProject?.displayName ?? "Sessions")
     }
@@ -2049,6 +2391,19 @@ struct ConversationView: View {
                         }
                         .padding(24)
                         .frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                    .onChange(of: model.pendingScrollEdge) { _, edge in
+                        guard let edge else { return }
+                        let groups = model.visibleQueryGroups
+                        guard !groups.isEmpty else {
+                            model.pendingScrollEdge = nil
+                            return
+                        }
+                        let targetID = edge == .top ? groups.first!.id : groups.last!.id
+                        withAnimation(.easeOut(duration: 0.25)) {
+                            proxy.scrollTo(targetID, anchor: .top)
+                        }
+                        model.pendingScrollEdge = nil
                     }
                     .onChange(of: model.pendingSearchMessageID) { _, messageID in
                         guard let messageID else {
@@ -2085,21 +2440,11 @@ struct ConversationView: View {
 
     private var header: some View {
         VStack(alignment: .leading, spacing: 6) {
-            HStack(alignment: .firstTextBaseline, spacing: 12) {
-                Text(model.selectedSession?.displayTitle ?? "Select a session")
-                    .font(.title3)
-                    .fontWeight(.semibold)
-                    .lineLimit(2)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                Text(model.appVersionLabel)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
-                if model.isLoading {
-                    ProgressView()
-                        .controlSize(.small)
-                }
-            }
+            Text(model.selectedSession?.displayTitle ?? "Select a session")
+                .font(.title3)
+                .fontWeight(.semibold)
+                .lineLimit(2)
+                .frame(maxWidth: .infinity, alignment: .leading)
             if let session = model.selectedSession {
                 HStack(spacing: 12) {
                     Text(session.source.displayName)
@@ -2141,6 +2486,22 @@ struct ConversationView: View {
                 } label: {
                     Label("Collapse", systemImage: "arrow.down.right.and.arrow.up.left")
                 }
+                Divider()
+                    .frame(height: 16)
+                Button {
+                    model.pendingScrollEdge = .top
+                } label: {
+                    Label("Top", systemImage: "arrow.up.to.line")
+                }
+                .keyboardShortcut(.upArrow, modifiers: .command)
+                .disabled(model.visibleQueryGroups.isEmpty)
+                Button {
+                    model.pendingScrollEdge = .bottom
+                } label: {
+                    Label("End", systemImage: "arrow.down.to.line")
+                }
+                .keyboardShortcut(.downArrow, modifiers: .command)
+                .disabled(model.visibleQueryGroups.isEmpty)
             }
             .labelStyle(.titleAndIcon)
             .controlSize(.small)
@@ -2311,35 +2672,69 @@ struct QueryGroupView: View {
             .padding(.top, 12)
             .padding(.leading, 22)
         } label: {
-            VStack(alignment: .leading, spacing: 8) {
-                HStack(alignment: .firstTextBaseline) {
-                    Text("Query")
-                        .font(.headline)
-                    if let timestamp = group.query.timestamp {
-                        Text(timestamp, format: .dateTime.year().month().day().hour().minute())
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                    }
-                    Spacer()
-                    Text("\(group.responseCount) replies")
+            if group.kind == .meta {
+                metaLabel
+            } else {
+                queryLabel
+            }
+        }
+    }
+
+    private var queryLabel: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(alignment: .firstTextBaseline) {
+                Text("Query")
+                    .font(.headline)
+                if let timestamp = group.query.timestamp {
+                    Text(timestamp, format: .dateTime.year().month().day().hour().minute())
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
-                Text(highlightedString(group.query.message, query: model.trimmedSearchText))
-                    .textSelection(.enabled)
-                    .font(.body)
-                    .lineSpacing(4)
-                    .frame(maxWidth: .infinity, alignment: .leading)
+                Spacer()
+                Text("\(group.responseCount) replies")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
             }
-            .padding(14)
-            .id(group.query.id)
-            .background(group.id == model.activeSearchGroupID ? Color.yellow.opacity(0.16) : Color.accentColor.opacity(0.10))
-            .clipShape(RoundedRectangle(cornerRadius: 8))
-            .overlay(
-                RoundedRectangle(cornerRadius: 8)
-                    .stroke(group.id == model.activeSearchGroupID ? Color.accentColor : Color(nsColor: .separatorColor), lineWidth: group.id == model.activeSearchGroupID ? 1 : 0.5)
-            )
+            Text(highlightedString(group.query.message, query: model.trimmedSearchText))
+                .textSelection(.enabled)
+                .font(.body)
+                .lineSpacing(4)
+                .frame(maxWidth: .infinity, alignment: .leading)
         }
+        .padding(14)
+        .id(group.query.id)
+        .background(group.id == model.activeSearchGroupID ? Color.yellow.opacity(0.16) : Color.accentColor.opacity(0.10))
+        .clipShape(RoundedRectangle(cornerRadius: 8))
+        .overlay(
+            RoundedRectangle(cornerRadius: 8)
+                .stroke(group.id == model.activeSearchGroupID ? Color.accentColor : Color(nsColor: .separatorColor), lineWidth: group.id == model.activeSearchGroupID ? 1 : 0.5)
+        )
+    }
+
+    private var metaLabel: some View {
+        HStack(alignment: .firstTextBaseline, spacing: 8) {
+            Image(systemName: "gearshape.fill")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            Text(group.query.message)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            if let timestamp = group.query.timestamp {
+                Text(timestamp, format: .dateTime.year().month().day().hour().minute())
+                    .font(.caption2)
+                    .foregroundStyle(.tertiary)
+            }
+            Spacer()
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 6)
+        .id(group.query.id)
+        .background(Color(nsColor: .windowBackgroundColor).opacity(0.5))
+        .clipShape(RoundedRectangle(cornerRadius: 6))
+        .overlay(
+            RoundedRectangle(cornerRadius: 6)
+                .stroke(Color(nsColor: .separatorColor).opacity(0.5), lineWidth: 0.5)
+        )
     }
 }
 
@@ -2407,7 +2802,7 @@ struct AiCliLogApp: App {
                 } label: {
                     Label("Search Messages", systemImage: "magnifyingglass")
                 }
-                .keyboardShortcut("f", modifiers: [.command, .option])
+                .keyboardShortcut("f", modifiers: [.command])
             }
         }
 
