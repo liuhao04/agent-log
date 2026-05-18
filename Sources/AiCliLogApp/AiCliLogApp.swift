@@ -10,6 +10,7 @@ private let searchLogger = Logger(subsystem: "io.github.aiclilog", category: "se
 enum LogSource: String, CaseIterable, Identifiable, Hashable, Sendable {
     case codex
     case claude
+    case cowork
 
     var id: String { rawValue }
 
@@ -19,6 +20,8 @@ enum LogSource: String, CaseIterable, Identifiable, Hashable, Sendable {
             return "Codex"
         case .claude:
             return "Claude"
+        case .cowork:
+            return "Claude Cowork"
         }
     }
 }
@@ -530,6 +533,146 @@ final class ClaudeStore {
     }
 }
 
+private struct CoworkSidecar: Decodable {
+    let sessionId: String?
+    let cliSessionId: String?
+    let title: String?
+    let cwd: String?
+    let userSelectedFolders: [String]?
+    let createdAt: Double?
+    let lastActivityAt: Double?
+    let model: String?
+    let isArchived: Bool?
+}
+
+final class CoworkStore {
+    private let claudeAppHome: URL
+    private var sessionsRoot: URL {
+        claudeAppHome.appendingPathComponent("local-agent-mode-sessions")
+    }
+
+    init(claudeAppHome: URL = FileManager.default.homeDirectoryForCurrentUser
+        .appendingPathComponent("Library/Application Support/Claude")) {
+        self.claudeAppHome = claudeAppHome
+    }
+
+    func projects(from sessions: [CodexSession]) -> [ProjectSummary] {
+        var grouped: [String: (count: Int, updatedAt: Date)] = [:]
+        for session in sessions {
+            let existing = grouped[session.cwd]
+            grouped[session.cwd] = (
+                count: (existing?.count ?? 0) + 1,
+                updatedAt: max(existing?.updatedAt ?? .distantPast, session.updatedAt)
+            )
+        }
+        return grouped.map { cwd, value in
+            ProjectSummary(cwd: cwd, sessionCount: value.count, updatedAt: value.updatedAt, sources: [.cowork])
+        }
+        .sorted { left, right in
+            if left.updatedAt == right.updatedAt {
+                return left.cwd < right.cwd
+            }
+            return left.updatedAt > right.updatedAt
+        }
+    }
+
+    func sessions(cwd: String, from sessions: [CodexSession]) -> [CodexSession] {
+        sessions
+            .filter { $0.cwd == cwd }
+            .sorted { left, right in
+                if left.updatedAt == right.updatedAt {
+                    return left.sessionID > right.sessionID
+                }
+                return left.updatedAt > right.updatedAt
+            }
+    }
+
+    func allSessions() throws -> [CodexSession] {
+        let fileManager = FileManager.default
+        guard fileManager.fileExists(atPath: sessionsRoot.path) else {
+            return []
+        }
+
+        var results: [CodexSession] = []
+        let decoder = JSONDecoder()
+
+        // Layout: <root>/<userId>/<workspaceId>/local_<sessionId>.json
+        let userDirs = (try? fileManager.contentsOfDirectory(at: sessionsRoot, includingPropertiesForKeys: nil, options: [.skipsHiddenFiles])) ?? []
+        for userDir in userDirs {
+            try Task.checkCancellation()
+            var isDir: ObjCBool = false
+            guard fileManager.fileExists(atPath: userDir.path, isDirectory: &isDir), isDir.boolValue else { continue }
+
+            let workspaceDirs = (try? fileManager.contentsOfDirectory(at: userDir, includingPropertiesForKeys: nil, options: [.skipsHiddenFiles])) ?? []
+            for workspaceDir in workspaceDirs {
+                try Task.checkCancellation()
+                var wsIsDir: ObjCBool = false
+                guard fileManager.fileExists(atPath: workspaceDir.path, isDirectory: &wsIsDir), wsIsDir.boolValue else { continue }
+
+                let entries = (try? fileManager.contentsOfDirectory(at: workspaceDir, includingPropertiesForKeys: nil, options: [.skipsHiddenFiles])) ?? []
+                for entry in entries {
+                    guard entry.pathExtension == "json",
+                          entry.lastPathComponent.hasPrefix("local_"),
+                          !entry.lastPathComponent.hasSuffix(".bak.json"),
+                          !entry.lastPathComponent.hasSuffix(".json.bak")
+                    else { continue }
+
+                    guard let data = try? Data(contentsOf: entry),
+                          let sidecar = try? decoder.decode(CoworkSidecar.self, from: data),
+                          let cliSessionId = sidecar.cliSessionId, !cliSessionId.isEmpty
+                    else { continue }
+
+                    // Inner session directory holds the JSONL transcript under .claude/projects/<encoded>/<cliSessionId>.jsonl
+                    let innerDirName = entry.deletingPathExtension().lastPathComponent
+                    let innerDir = workspaceDir.appendingPathComponent(innerDirName, isDirectory: true)
+                    let projectsDir = innerDir.appendingPathComponent(".claude/projects", isDirectory: true)
+                    guard let transcriptURL = locateTranscript(in: projectsDir, cliSessionId: cliSessionId) else {
+                        continue
+                    }
+
+                    let cwd = (sidecar.userSelectedFolders?.first(where: { !$0.isEmpty })) ?? sidecar.cwd ?? innerDir.path
+                    let updatedAt = sidecar.lastActivityAt
+                        .map { Date(timeIntervalSince1970: $0 / 1000) }
+                        ?? fileModificationDate(transcriptURL)
+                        ?? .distantPast
+                    let title = (sidecar.title?.trimmingCharacters(in: .whitespacesAndNewlines)).flatMap { $0.isEmpty ? nil : $0 }
+                        ?? cliSessionId
+                    let model = (sidecar.model?.isEmpty == false ? sidecar.model! : "Claude Cowork")
+
+                    results.append(CodexSession(
+                        sessionID: cliSessionId,
+                        source: .cowork,
+                        cwd: cwd,
+                        title: String(title.prefix(120)),
+                        transcriptPath: transcriptURL.path,
+                        updatedAt: updatedAt,
+                        model: model,
+                        gitBranch: ""
+                    ))
+                }
+            }
+        }
+        return results
+    }
+
+    private func locateTranscript(in projectsDir: URL, cliSessionId: String) -> URL? {
+        let fileManager = FileManager.default
+        guard fileManager.fileExists(atPath: projectsDir.path) else { return nil }
+        guard let enumerator = fileManager.enumerator(
+            at: projectsDir,
+            includingPropertiesForKeys: nil,
+            options: [.skipsHiddenFiles]
+        ) else { return nil }
+        let target = "\(cliSessionId).jsonl"
+        for case let url as URL in enumerator {
+            if url.lastPathComponent == target {
+                return url
+            }
+        }
+        return nil
+    }
+}
+
 private struct SearchIndexSummary: Sendable {
     let indexedFiles: Int
     let indexedMessages: Int
@@ -776,7 +919,7 @@ private final class SearchIndexStore {
         switch session.source {
         case .codex:
             return try CodexStore().messages(for: session)
-        case .claude:
+        case .claude, .cowork:
             return try ClaudeStore().messages(for: session)
         }
     }
@@ -1925,6 +2068,10 @@ final class AppModel: ObservableObject {
             let claudeStore = ClaudeStore()
             knownClaudeSessions = try claudeStore.allSessions()
             projectItems += try claudeStore.projects(from: knownClaudeSessions)
+            let coworkStore = CoworkStore()
+            let coworkSessions = try coworkStore.allSessions()
+            knownClaudeSessions += coworkSessions
+            projectItems += coworkStore.projects(from: coworkSessions)
         }
         let projects = mergedProjects(projectItems)
         try Task.checkCancellation()
@@ -2001,6 +2148,8 @@ final class AppModel: ObservableObject {
             let claudeStore = ClaudeStore()
             if knownClaudeSessions.isEmpty {
                 sessions += try claudeStore.sessions(cwd: cwd)
+                let coworkSessions = try CoworkStore().allSessions()
+                sessions += CoworkStore().sessions(cwd: cwd, from: coworkSessions)
             } else {
                 sessions += try claudeStore.sessions(cwd: cwd, from: knownClaudeSessions)
             }
@@ -2020,7 +2169,7 @@ final class AppModel: ObservableObject {
         switch session.source {
         case .codex:
             return try CodexStore().messages(for: session)
-        case .claude:
+        case .claude, .cowork:
             return try ClaudeStore().messages(for: session)
         }
     }
@@ -2074,9 +2223,14 @@ final class AppModel: ObservableObject {
     private nonisolated static func allSearchSessions(knownClaudeSessions: [CodexSession]) throws -> [CodexSession] {
         try Task.checkCancellation()
         let codexSessions = try CodexStore().allSessions()
-        let claudeSessions = knownClaudeSessions.isEmpty ? try ClaudeStore().allSessions() : knownClaudeSessions
+        let claudeAndCowork: [CodexSession]
+        if knownClaudeSessions.isEmpty {
+            claudeAndCowork = try ClaudeStore().allSessions() + CoworkStore().allSessions()
+        } else {
+            claudeAndCowork = knownClaudeSessions
+        }
         try Task.checkCancellation()
-        return codexSessions + claudeSessions
+        return codexSessions + claudeAndCowork
     }
 
     private nonisolated static func mergedProjects(_ items: [ProjectSummary]) -> [ProjectSummary] {
@@ -2743,6 +2897,12 @@ struct MessageView: View {
     let searchText: String
     let isFocused: Bool
 
+    @State private var isPreviewing: Bool = false
+
+    private var canPreview: Bool {
+        item.speaker != "You"
+    }
+
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
             HStack {
@@ -2753,12 +2913,27 @@ struct MessageView: View {
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
+                Spacer()
+                if canPreview {
+                    Button {
+                        isPreviewing.toggle()
+                    } label: {
+                        Image(systemName: isPreviewing ? "doc.plaintext" : "doc.richtext")
+                    }
+                    .buttonStyle(.borderless)
+                    .help(isPreviewing ? "Show raw text" : "Render markdown")
+                }
             }
-            Text(highlightedString(item.message, query: searchText))
-                .textSelection(.enabled)
-                .font(.body)
-                .lineSpacing(4)
-                .frame(maxWidth: .infinity, alignment: .leading)
+            if isPreviewing {
+                MarkdownRenderedView(text: item.message)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            } else {
+                Text(highlightedString(item.message, query: searchText))
+                    .textSelection(.enabled)
+                    .font(.body)
+                    .lineSpacing(4)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
         }
         .padding(14)
         .background(messageBackground)
@@ -2774,6 +2949,472 @@ struct MessageView: View {
             return Color.yellow.opacity(0.16)
         }
         return item.speaker == "You" ? Color.accentColor.opacity(0.10) : Color(nsColor: .textBackgroundColor)
+    }
+}
+
+private struct MdListItem {
+    let text: String
+    let checked: Bool?
+    let children: [MdList]
+}
+
+private struct MdList {
+    let ordered: Bool
+    let items: [MdListItem]
+}
+
+private enum MdAlignment {
+    case leading, center, trailing
+}
+
+private struct MdTable {
+    let headers: [String]
+    let alignments: [MdAlignment]
+    let rows: [[String]]
+}
+
+private enum MarkdownBlock {
+    case heading(level: Int, text: String)
+    case paragraph(String)
+    case codeBlock(language: String?, code: String)
+    case list(MdList)
+    case blockquote(String)
+    case horizontalRule
+    case table(MdTable)
+}
+
+private struct ListLineInfo {
+    let indent: Int
+    let ordered: Bool
+    let checked: Bool?
+    let content: String
+}
+
+private func parseListLine(_ raw: String) -> ListLineInfo? {
+    var indent = 0
+    for ch in raw {
+        if ch == " " { indent += 1 }
+        else if ch == "\t" { indent += 4 }
+        else { break }
+    }
+    let body = String(raw.dropFirst(raw.prefix { $0 == " " || $0 == "\t" }.count))
+    guard !body.isEmpty else { return nil }
+
+    var ordered = false
+    var contentStart: String.Index?
+
+    if body.hasPrefix("- ") || body.hasPrefix("* ") || body.hasPrefix("+ ") {
+        contentStart = body.index(body.startIndex, offsetBy: 2)
+    } else if let dot = body.firstIndex(of: "."),
+              dot > body.startIndex,
+              body[..<dot].allSatisfy({ $0.isNumber }) {
+        let after = body.index(after: dot)
+        if after < body.endIndex, body[after] == " " {
+            ordered = true
+            contentStart = body.index(after: after)
+        }
+    }
+
+    guard let cs = contentStart else { return nil }
+    var content = String(body[cs..<body.endIndex])
+    var checked: Bool? = nil
+    if content.hasPrefix("[ ] ") {
+        checked = false
+        content = String(content.dropFirst(4))
+    } else if content.lowercased().hasPrefix("[x] ") {
+        checked = true
+        content = String(content.dropFirst(4))
+    } else if content == "[ ]" {
+        checked = false
+        content = ""
+    } else if content.lowercased() == "[x]" {
+        checked = true
+        content = ""
+    }
+
+    return ListLineInfo(indent: indent, ordered: ordered, checked: checked, content: content)
+}
+
+private func buildNestedList(_ items: [ListLineInfo], start: inout Int) -> MdList? {
+    guard start < items.count else { return nil }
+    let baseIndent = items[start].indent
+    let ordered = items[start].ordered
+    var built: [MdListItem] = []
+
+    while start < items.count, items[start].indent == baseIndent {
+        let cur = items[start]
+        start += 1
+        var children: [MdList] = []
+        while start < items.count, items[start].indent > baseIndent {
+            if let child = buildNestedList(items, start: &start) {
+                children.append(child)
+            } else {
+                break
+            }
+        }
+        built.append(MdListItem(text: cur.text(), checked: cur.checked, children: children))
+    }
+    return MdList(ordered: ordered, items: built)
+}
+
+extension ListLineInfo {
+    func text() -> String { content }
+}
+
+private func splitTableRow(_ line: String) -> [String] {
+    var s = line.trimmingCharacters(in: .whitespaces)
+    if s.hasPrefix("|") { s.removeFirst() }
+    if s.hasSuffix("|") { s.removeLast() }
+    return s.components(separatedBy: "|").map { $0.trimmingCharacters(in: .whitespaces) }
+}
+
+private func tableAlignment(_ cell: String) -> MdAlignment? {
+    let t = cell.trimmingCharacters(in: .whitespaces)
+    guard !t.isEmpty else { return nil }
+    let leading = t.hasPrefix(":")
+    let trailing = t.hasSuffix(":")
+    var middle = t
+    if leading { middle.removeFirst() }
+    if trailing && !middle.isEmpty { middle.removeLast() }
+    guard !middle.isEmpty, middle.allSatisfy({ $0 == "-" }) else { return nil }
+    if leading && trailing { return .center }
+    if trailing { return .trailing }
+    return .leading
+}
+
+private func tableSeparatorAlignments(_ cells: [String]) -> [MdAlignment]? {
+    guard !cells.isEmpty else { return nil }
+    var aligns: [MdAlignment] = []
+    for c in cells {
+        guard let a = tableAlignment(c) else { return nil }
+        aligns.append(a)
+    }
+    return aligns
+}
+
+private func parseMarkdownBlocks(_ text: String) -> [MarkdownBlock] {
+    var blocks: [MarkdownBlock] = []
+    let lines = text.components(separatedBy: "\n")
+    var index = 0
+
+    func flushParagraph(_ buffer: inout [String]) {
+        guard !buffer.isEmpty else { return }
+        let joined = buffer.joined(separator: "\n")
+        if !joined.trimmingCharacters(in: .whitespaces).isEmpty {
+            blocks.append(.paragraph(joined))
+        }
+        buffer.removeAll()
+    }
+
+    var paragraphBuffer: [String] = []
+
+    while index < lines.count {
+        let line = lines[index]
+        let trimmed = line.trimmingCharacters(in: .whitespaces)
+
+        if trimmed.isEmpty {
+            flushParagraph(&paragraphBuffer)
+            index += 1
+            continue
+        }
+
+        if trimmed.hasPrefix("```") {
+            flushParagraph(&paragraphBuffer)
+            let fenceLine = trimmed
+            let lang = String(fenceLine.dropFirst(3)).trimmingCharacters(in: .whitespaces)
+            index += 1
+            var codeLines: [String] = []
+            while index < lines.count {
+                let l = lines[index]
+                if l.trimmingCharacters(in: .whitespaces).hasPrefix("```") {
+                    index += 1
+                    break
+                }
+                codeLines.append(l)
+                index += 1
+            }
+            blocks.append(.codeBlock(language: lang.isEmpty ? nil : lang, code: codeLines.joined(separator: "\n")))
+            continue
+        }
+
+        if trimmed == "---" || trimmed == "***" || trimmed == "___" {
+            flushParagraph(&paragraphBuffer)
+            blocks.append(.horizontalRule)
+            index += 1
+            continue
+        }
+
+        if trimmed.hasPrefix("#") {
+            let hashes = trimmed.prefix { $0 == "#" }
+            let level = hashes.count
+            if level <= 6, trimmed.count > level, trimmed[trimmed.index(trimmed.startIndex, offsetBy: level)] == " " {
+                flushParagraph(&paragraphBuffer)
+                let content = String(trimmed.dropFirst(level + 1)).trimmingCharacters(in: .whitespaces)
+                blocks.append(.heading(level: level, text: content))
+                index += 1
+                continue
+            }
+        }
+
+        if trimmed.hasPrefix("> ") || trimmed == ">" {
+            flushParagraph(&paragraphBuffer)
+            var quoteLines: [String] = []
+            while index < lines.count {
+                let t = lines[index].trimmingCharacters(in: .whitespaces)
+                if t.hasPrefix("> ") {
+                    quoteLines.append(String(t.dropFirst(2)))
+                } else if t == ">" {
+                    quoteLines.append("")
+                } else {
+                    break
+                }
+                index += 1
+            }
+            blocks.append(.blockquote(quoteLines.joined(separator: "\n")))
+            continue
+        }
+
+        if let _ = parseListLine(line) {
+            flushParagraph(&paragraphBuffer)
+            var listLines: [ListLineInfo] = []
+            while index < lines.count, let info = parseListLine(lines[index]) {
+                listLines.append(info)
+                index += 1
+            }
+            var cursor = 0
+            if let list = buildNestedList(listLines, start: &cursor) {
+                blocks.append(.list(list))
+            }
+            continue
+        }
+
+        if trimmed.contains("|"), index + 1 < lines.count {
+            let nextTrimmed = lines[index + 1].trimmingCharacters(in: .whitespaces)
+            if nextTrimmed.contains("|") || nextTrimmed.contains("-") {
+                let headerCells = splitTableRow(trimmed)
+                let sepCells = splitTableRow(nextTrimmed)
+                if headerCells.count >= 1,
+                   sepCells.count == headerCells.count,
+                   let aligns = tableSeparatorAlignments(sepCells) {
+                    flushParagraph(&paragraphBuffer)
+                    index += 2
+                    var rows: [[String]] = []
+                    while index < lines.count {
+                        let t = lines[index].trimmingCharacters(in: .whitespaces)
+                        guard !t.isEmpty, t.contains("|") else { break }
+                        let cells = splitTableRow(t)
+                        var padded = cells
+                        while padded.count < headerCells.count { padded.append("") }
+                        if padded.count > headerCells.count {
+                            padded = Array(padded.prefix(headerCells.count))
+                        }
+                        rows.append(padded)
+                        index += 1
+                    }
+                    blocks.append(.table(MdTable(headers: headerCells, alignments: aligns, rows: rows)))
+                    continue
+                }
+            }
+        }
+
+        paragraphBuffer.append(line)
+        index += 1
+    }
+
+    flushParagraph(&paragraphBuffer)
+    return blocks
+}
+
+private func inlineAttributed(_ text: String) -> AttributedString {
+    if let attr = try? AttributedString(
+        markdown: text,
+        options: AttributedString.MarkdownParsingOptions(
+            allowsExtendedAttributes: true,
+            interpretedSyntax: .inlineOnlyPreservingWhitespace,
+            failurePolicy: .returnPartiallyParsedIfPossible
+        )
+    ) {
+        return attr
+    }
+    return AttributedString(text)
+}
+
+struct MarkdownRenderedView: View {
+    let text: String
+
+    var body: some View {
+        let blocks = parseMarkdownBlocks(text)
+        VStack(alignment: .leading, spacing: 10) {
+            ForEach(Array(blocks.enumerated()), id: \.offset) { _, block in
+                blockView(block)
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func blockView(_ block: MarkdownBlock) -> some View {
+        switch block {
+        case .heading(let level, let text):
+            Text(inlineAttributed(text))
+                .font(headingFont(level: level))
+                .textSelection(.enabled)
+                .frame(maxWidth: .infinity, alignment: .leading)
+        case .paragraph(let text):
+            Text(inlineAttributed(text))
+                .font(.body)
+                .lineSpacing(4)
+                .textSelection(.enabled)
+                .frame(maxWidth: .infinity, alignment: .leading)
+        case .codeBlock(let language, let code):
+            VStack(alignment: .leading, spacing: 4) {
+                if let language, !language.isEmpty {
+                    Text(language)
+                        .font(.caption.monospaced())
+                        .foregroundStyle(.secondary)
+                }
+                ScrollView(.horizontal, showsIndicators: false) {
+                    Text(code)
+                        .font(.system(.body, design: .monospaced))
+                        .textSelection(.enabled)
+                        .padding(10)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                .background(Color(nsColor: .textBackgroundColor).opacity(0.6))
+                .clipShape(RoundedRectangle(cornerRadius: 6))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 6)
+                        .stroke(Color(nsColor: .separatorColor), lineWidth: 0.5)
+                )
+            }
+        case .list(let list):
+            listView(list, depth: 0)
+        case .table(let table):
+            tableView(table)
+        case .blockquote(let text):
+            HStack(spacing: 8) {
+                Rectangle()
+                    .fill(Color(nsColor: .separatorColor))
+                    .frame(width: 3)
+                Text(inlineAttributed(text))
+                    .font(.body.italic())
+                    .foregroundStyle(.secondary)
+                    .textSelection(.enabled)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            .fixedSize(horizontal: false, vertical: true)
+        case .horizontalRule:
+            Divider()
+        }
+    }
+
+    private func listView(_ list: MdList, depth: Int) -> AnyView {
+        AnyView(
+            VStack(alignment: .leading, spacing: 4) {
+                ForEach(Array(list.items.enumerated()), id: \.offset) { idx, item in
+                    VStack(alignment: .leading, spacing: 4) {
+                        HStack(alignment: .firstTextBaseline, spacing: 8) {
+                            marker(for: item, index: idx, ordered: list.ordered)
+                            Text(inlineAttributed(item.text))
+                                .font(.body)
+                                .textSelection(.enabled)
+                                .strikethrough(item.checked == true, color: .secondary)
+                                .foregroundStyle(item.checked == true ? AnyShapeStyle(.secondary) : AnyShapeStyle(.primary))
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                        }
+                        if !item.children.isEmpty {
+                            VStack(alignment: .leading, spacing: 4) {
+                                ForEach(Array(item.children.enumerated()), id: \.offset) { _, child in
+                                    listView(child, depth: depth + 1)
+                                }
+                            }
+                            .padding(.leading, 20)
+                        }
+                    }
+                }
+            }
+        )
+    }
+
+    @ViewBuilder
+    private func marker(for item: MdListItem, index: Int, ordered: Bool) -> some View {
+        if let checked = item.checked {
+            Image(systemName: checked ? "checkmark.square.fill" : "square")
+                .foregroundStyle(checked ? Color.accentColor : .secondary)
+        } else if ordered {
+            Text("\(index + 1).")
+                .font(.body.monospacedDigit())
+                .foregroundStyle(.secondary)
+        } else {
+            Text("•").font(.body).foregroundStyle(.secondary)
+        }
+    }
+
+    @ViewBuilder
+    private func tableView(_ table: MdTable) -> some View {
+        let columns = table.headers.count
+        ScrollView(.horizontal, showsIndicators: false) {
+            Grid(alignment: .topLeading, horizontalSpacing: 18, verticalSpacing: 6) {
+                GridRow {
+                    ForEach(0..<columns, id: \.self) { i in
+                        let text = i < table.headers.count ? table.headers[i] : ""
+                        let align = i < table.alignments.count ? table.alignments[i] : .leading
+                        Text(inlineAttributed(text))
+                            .font(.body.bold())
+                            .textSelection(.enabled)
+                            .multilineTextAlignment(textAlignment(align))
+                            .gridColumnAlignment(horizontalAlignment(align))
+                    }
+                }
+                Divider()
+                    .gridCellUnsizedAxes(.horizontal)
+                ForEach(Array(table.rows.enumerated()), id: \.offset) { _, row in
+                    GridRow {
+                        ForEach(0..<columns, id: \.self) { i in
+                            let text = i < row.count ? row[i] : ""
+                            let align = i < table.alignments.count ? table.alignments[i] : .leading
+                            Text(inlineAttributed(text))
+                                .font(.body)
+                                .textSelection(.enabled)
+                                .multilineTextAlignment(textAlignment(align))
+                        }
+                    }
+                }
+            }
+            .padding(10)
+        }
+        .background(Color(nsColor: .textBackgroundColor).opacity(0.4))
+        .clipShape(RoundedRectangle(cornerRadius: 6))
+        .overlay(
+            RoundedRectangle(cornerRadius: 6)
+                .stroke(Color(nsColor: .separatorColor), lineWidth: 0.5)
+        )
+    }
+
+    private func horizontalAlignment(_ a: MdAlignment) -> HorizontalAlignment {
+        switch a {
+        case .leading: return .leading
+        case .center: return .center
+        case .trailing: return .trailing
+        }
+    }
+
+    private func textAlignment(_ a: MdAlignment) -> TextAlignment {
+        switch a {
+        case .leading: return .leading
+        case .center: return .center
+        case .trailing: return .trailing
+        }
+    }
+
+    private func headingFont(level: Int) -> Font {
+        switch level {
+        case 1: return .title.bold()
+        case 2: return .title2.bold()
+        case 3: return .title3.bold()
+        case 4: return .headline
+        case 5: return .subheadline.bold()
+        default: return .body.bold()
+        }
     }
 }
 
