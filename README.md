@@ -1,33 +1,33 @@
-# AiCliLog
+# AgentLog
 
 [中文说明](README.zh-CN.md)
 
 A native macOS app for browsing local Codex CLI and Claude Code conversation logs.
 
-AiCliLog reads your local Codex CLI and Claude Code history, groups
+AgentLog reads your local Codex CLI and Claude Code history, groups
 conversations by project, and shows each session as a clean query-based
 transcript. It is designed for people who use coding agents heavily and want a
 faster way to revisit previous project conversations.
 
-## Why AiCliLog
+## Why AgentLog
 
-- **Local-first and privacy-focused.** AiCliLog reads files on your Mac and does
+- **Local-first and privacy-focused.** AgentLog reads files on your Mac and does
   not upload logs, sync data, or add telemetry. This matters because coding
   agent transcripts often contain project paths, source snippets, research
   ideas, account context, and debugging details.
 - **One native macOS app for both Codex CLI and Claude Code.** Many log viewers
-  only target one agent. AiCliLog unifies Codex and Claude sessions in the same
+  only target one agent. AgentLog unifies Codex and Claude sessions in the same
   project/session/conversation model.
 - **Project-centered browsing.** The app is organized around real development
   projects: projects on the left, sessions in the middle, and a readable
   conversation pane on the right.
-- **Clean query/response reading.** Instead of dumping raw JSONL events, AiCliLog
+- **Clean query/response reading.** Instead of dumping raw JSONL events, AgentLog
   groups the transcript by user query, supports expand/collapse, and keeps the
   view focused on the conversation.
 - **Global local search.** A local SQLite search index lets you search across
   Codex and Claude sessions, filter by source or project, and jump back to the
   matched query or response.
-- **Small, inspectable, and purpose-built.** AiCliLog is a focused local history
+- **Small, inspectable, and purpose-built.** AgentLog is a focused local history
   reader, not an agent runner, cloud dashboard, or analytics platform. The code
   lives in this repository and the data access behavior is easy to audit.
 
@@ -72,16 +72,16 @@ default. Both storage formats are internal and may change in future releases.
 Scripts/install-app.sh
 ```
 
-This builds the app, installs it to `/Applications/AiCliLog.app`, and opens
+This builds the app, installs it to `/Applications/AgentLog.app`, and opens
 it.
 
 ## Build Without Installing
 
 ```bash
-xcodebuild -project AiCliLogApp.xcodeproj -scheme "AiCliLog" -configuration Debug -destination 'platform=macOS' build
+xcodebuild -project AgentLogApp.xcodeproj -scheme "AgentLog" -configuration Debug -destination 'platform=macOS' build
 ```
 
-You can also open `AiCliLogApp.xcodeproj` in Xcode and run the `AiCliLog`
+You can also open `AgentLogApp.xcodeproj` in Xcode and run the `AgentLog`
 scheme.
 
 ## App Icon
@@ -96,7 +96,7 @@ The generated PNGs are stored in `App/Assets.xcassets/AppIcon.appiconset`.
 
 ## Privacy
 
-AiCliLog is local-first. It does not send your conversation logs to
+AgentLog is local-first. It does not send your conversation logs to
 any server. See [PRIVACY.md](PRIVACY.md) for details.
 
 ## Sandbox Note

@@ -1,6 +1,6 @@
 # Privacy
 
-AiCliLog reads local Codex CLI and Claude Code files on your Mac:
+AgentLog reads local Codex CLI and Claude Code files on your Mac:
 
 - `~/.codex/state_5.sqlite`
 - `~/.codex/sessions/**/rollout-*.jsonl`

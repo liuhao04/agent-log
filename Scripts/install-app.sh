@@ -2,22 +2,21 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-APP_NAME="AiCliLog.app"
-APP_PROCESS="AiCliLog"
-PREVIOUS_APP_PROCESS="$(printf "%s %s %s" "AI" "CLI" "Log")"
-PREVIOUS_APP_NAME="$PREVIOUS_APP_PROCESS.app"
-LEGACY_APP_PROCESS="$(printf "%s %s %s" "Codex" "CLI" "Log")"
-LEGACY_APP_NAME="$LEGACY_APP_PROCESS.app"
+APP_NAME="AgentLog.app"
+APP_PROCESS="AgentLog"
+OLD_APP_PROCESSES=(
+  "AiCliLog"
+  "$(printf "%s %s %s" "AI" "CLI" "Log")"
+  "$(printf "%s %s %s" "Codex" "CLI" "Log")"
+)
 INSTALL_APP="/Applications/$APP_NAME"
-PREVIOUS_INSTALL_APP="/Applications/$PREVIOUS_APP_NAME"
-LEGACY_INSTALL_APP="/Applications/$LEGACY_APP_NAME"
 LSREGISTER="/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister"
 
 cd "$ROOT"
 
 xcodebuild \
-  -project AiCliLogApp.xcodeproj \
-  -scheme "AiCliLog" \
+  -project AgentLogApp.xcodeproj \
+  -scheme "AgentLog" \
   -configuration Debug \
   -destination "platform=macOS" \
   build
@@ -33,31 +32,45 @@ if [[ -z "${DERIVED_APP:-}" || ! -d "$DERIVED_APP" ]]; then
   exit 1
 fi
 
-if pgrep -x "$APP_PROCESS" >/dev/null || pgrep -x "$PREVIOUS_APP_PROCESS" >/dev/null || pgrep -x "$LEGACY_APP_PROCESS" >/dev/null; then
-  osascript -e 'tell application "AiCliLog" to quit' >/dev/null 2>&1 || true
-  osascript -e "tell application \"$PREVIOUS_APP_PROCESS\" to quit" >/dev/null 2>&1 || true
-  osascript -e "tell application \"$LEGACY_APP_PROCESS\" to quit" >/dev/null 2>&1 || true
-  for _ in {1..30}; do
-    if ! pgrep -x "$APP_PROCESS" >/dev/null && ! pgrep -x "$PREVIOUS_APP_PROCESS" >/dev/null && ! pgrep -x "$LEGACY_APP_PROCESS" >/dev/null; then
-      break
-    fi
-    sleep 0.2
-  done
-fi
+quit_if_running() {
+  local proc="$1"
+  if pgrep -x "$proc" >/dev/null; then
+    osascript -e "tell application \"$proc\" to quit" >/dev/null 2>&1 || true
+  fi
+}
 
-if [[ -x "$LSREGISTER" && -d "$INSTALL_APP" ]]; then
-  "$LSREGISTER" -u "$INSTALL_APP" >/dev/null 2>&1 || true
-fi
-if [[ -x "$LSREGISTER" && -d "$PREVIOUS_INSTALL_APP" ]]; then
-  "$LSREGISTER" -u "$PREVIOUS_INSTALL_APP" >/dev/null 2>&1 || true
-fi
-if [[ -x "$LSREGISTER" && -d "$LEGACY_INSTALL_APP" ]]; then
-  "$LSREGISTER" -u "$LEGACY_INSTALL_APP" >/dev/null 2>&1 || true
-fi
+quit_if_running "$APP_PROCESS"
+for proc in "${OLD_APP_PROCESSES[@]}"; do
+  quit_if_running "$proc"
+done
+
+for _ in {1..30}; do
+  running=0
+  pgrep -x "$APP_PROCESS" >/dev/null && running=1
+  for proc in "${OLD_APP_PROCESSES[@]}"; do
+    pgrep -x "$proc" >/dev/null && running=1
+  done
+  [[ $running -eq 0 ]] && break
+  sleep 0.2
+done
+
+unregister_app() {
+  local path="$1"
+  if [[ -x "$LSREGISTER" && -d "$path" ]]; then
+    "$LSREGISTER" -u "$path" >/dev/null 2>&1 || true
+  fi
+}
+
+unregister_app "$INSTALL_APP"
+for proc in "${OLD_APP_PROCESSES[@]}"; do
+  unregister_app "/Applications/$proc.app"
+done
 
 rm -rf "$INSTALL_APP"
-rm -rf "$PREVIOUS_INSTALL_APP"
-rm -rf "$LEGACY_INSTALL_APP"
+for proc in "${OLD_APP_PROCESSES[@]}"; do
+  rm -rf "/Applications/$proc.app"
+done
+
 ditto "$DERIVED_APP" "$INSTALL_APP"
 touch "$INSTALL_APP"
 

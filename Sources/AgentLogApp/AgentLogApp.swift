@@ -5,7 +5,7 @@ import OSLog
 import SwiftUI
 import UniformTypeIdentifiers
 
-private let searchLogger = Logger(subsystem: "io.github.aiclilog", category: "search")
+private let searchLogger = Logger(subsystem: "io.github.agentlog", category: "search")
 
 enum LogSource: String, CaseIterable, Identifiable, Hashable, Sendable {
     case codex
@@ -695,6 +695,12 @@ private final class SearchIndexStore {
     private var supportDirectory: URL {
         let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)
             .first ?? FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support")
+        return base.appendingPathComponent("AgentLog", isDirectory: true)
+    }
+
+    private var aiCliLogSupportDirectory: URL {
+        let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)
+            .first ?? FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support")
         return base.appendingPathComponent("AiCliLog", isDirectory: true)
     }
 
@@ -713,6 +719,10 @@ private final class SearchIndexStore {
     private var databaseURL: URL {
         supportDirectory
             .appendingPathComponent("search-index.sqlite")
+    }
+
+    private var aiCliLogDatabaseURL: URL {
+        aiCliLogSupportDirectory.appendingPathComponent("search-index.sqlite")
     }
 
     private var legacyDatabaseURL: URL {
@@ -847,7 +857,7 @@ private final class SearchIndexStore {
         guard !fileManager.fileExists(atPath: databaseURL.path) else {
             return
         }
-        guard let sourceURL = [previousDatabaseURL, legacyDatabaseURL].first(where: { fileManager.fileExists(atPath: $0.path) }) else {
+        guard let sourceURL = [aiCliLogDatabaseURL, previousDatabaseURL, legacyDatabaseURL].first(where: { fileManager.fileExists(atPath: $0.path) }) else {
             return
         }
 
@@ -1485,7 +1495,7 @@ final class ClaudeSummaryCache: @unchecked Sendable {
 
 final class FileSystemWatcher {
     private var stream: FSEventStreamRef?
-    private let queue = DispatchQueue(label: "io.github.aiclilog.fswatch")
+    private let queue = DispatchQueue(label: "io.github.agentlog.fswatch")
     var onChange: (([String]) -> Void)?
 
     func start(paths: [String]) {
@@ -1550,7 +1560,7 @@ final class EventIntervalLogger: @unchecked Sendable {
     init() {
         let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
             ?? FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support")
-        let dir = base.appendingPathComponent("AiCliLogApp", isDirectory: true)
+        let dir = base.appendingPathComponent("AgentLogApp", isDirectory: true)
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         self.url = dir.appendingPathComponent("fs-event-intervals.jsonl")
     }
@@ -2399,7 +2409,7 @@ struct ContentView: View {
             model.load()
             model.startWatchingIfNeeded()
         }
-        .alert("AiCliLog", isPresented: Binding(
+        .alert("AgentLog", isPresented: Binding(
             get: { model.errorMessage != nil },
             set: { if !$0 { model.errorMessage = nil } }
         )) {
@@ -3419,12 +3429,12 @@ struct MarkdownRenderedView: View {
 }
 
 @main
-struct AiCliLogApp: App {
+struct AgentLogApp: App {
     @StateObject private var model = AppModel()
     @Environment(\.openWindow) private var openWindow
 
     var body: some Scene {
-        WindowGroup("AiCliLog", id: "main") {
+        WindowGroup("AgentLog", id: "main") {
             ContentView(model: model)
         }
         .windowStyle(.titleBar)
@@ -3447,7 +3457,7 @@ struct AiCliLogApp: App {
             }
         }
 
-        MenuBarExtra("AiCliLog", systemImage: "magnifyingglass.circle") {
+        MenuBarExtra("AgentLog", systemImage: "magnifyingglass.circle") {
             Text(model.appVersionLabel)
             Divider()
             Button {

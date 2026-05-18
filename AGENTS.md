@@ -1,6 +1,6 @@
-# AiCliLog Project Instructions
+# AgentLog Project Instructions
 
-AiCliLogApp is a standalone macOS project for `AiCliLog.app`, a local log
+AgentLogApp is a standalone macOS project for `AgentLog.app`, a local log
 viewer for Codex CLI and Claude Code sessions.
 
 ## Project Context
@@ -14,12 +14,12 @@ viewer for Codex CLI and Claude Code sessions.
 
 ## App Identity
 
-- Product name: `AiCliLog`
-- Installed app path: `/Applications/AiCliLog.app`
-- Bundle identifier: `io.github.aiclilog`
-- Main source file: `Sources/AiCliLogApp/AiCliLogApp.swift`
+- Product name: `AgentLog`
+- Installed app path: `/Applications/AgentLog.app`
+- Bundle identifier: `io.github.agentlog`
+- Main source file: `Sources/AgentLogApp/AgentLogApp.swift`
 - App metadata: `App/Info.plist`
-- Xcode project: `AiCliLogApp.xcodeproj`
+- Xcode project: `AgentLogApp.xcodeproj`
 
 ## Build And Install
 
@@ -29,13 +29,13 @@ Use the repo script for normal verification and installation:
 Scripts/install-app.sh
 ```
 
-The script builds the `AiCliLog` scheme, replaces the app in
+The script builds the `AgentLog` scheme, replaces the app in
 `/Applications`, refreshes Launch Services, and opens the app.
 
 For build-only checks:
 
 ```bash
-xcodebuild -project AiCliLogApp.xcodeproj -scheme "AiCliLog" -configuration Debug -destination 'platform=macOS' build
+xcodebuild -project AgentLogApp.xcodeproj -scheme "AgentLog" -configuration Debug -destination 'platform=macOS' build
 ```
 
 ## Versioning Rule
@@ -44,7 +44,7 @@ When changing app code, app resources, Xcode project settings, install behavior,
 or user-visible documentation for the app:
 
 - Bump the app version/build as appropriate in both `App/Info.plist` and
-  `AiCliLogApp.xcodeproj/project.pbxproj`.
+  `AgentLogApp.xcodeproj/project.pbxproj`.
 - After a successful build, report the resulting marketing version and build
   number.
 - Automatically run `Scripts/install-app.sh` and restart/open the app before the
@@ -70,7 +70,7 @@ app reinstall.
 ## Implementation Notes
 
 - Prefer existing single-file SwiftUI/AppKit patterns in
-  `Sources/AiCliLogApp/AiCliLogApp.swift` unless a refactor is necessary.
+  `Sources/AgentLogApp/AgentLogApp.swift` unless a refactor is necessary.
 - Use structured parsers and SQLite APIs for log/index data; avoid ad hoc string
   parsing when a structured format is available.
 - Keep UI practical and dense. This is a developer utility, not a marketing
