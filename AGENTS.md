@@ -5,9 +5,8 @@ viewer for Codex CLI and Claude Code sessions.
 
 ## Project Context
 
-- Treat this directory as its own project root:
-  `<repo-root>`
-- Do not rely on the former nested path under `set-codex`.
+- Treat this directory (`<repo-root>`) as its own project root.
+- Do not rely on any former nested layout from earlier prototypes.
 - Preserve dirty worktrees. Never revert user changes unless explicitly asked.
 - Keep Claude-specific files if any are added later; Codex and Claude workflows
   should be able to coexist.
