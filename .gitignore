@@ -12,3 +12,8 @@ build/
 
 *.swp
 *~
+
+# AI CLI session logs / fixtures — never commit user transcripts
+*.jsonl
+.claude/
+.codex/
