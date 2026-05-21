@@ -277,7 +277,7 @@
 					"$(inherited)",
 					"@executable_path/../Frameworks",
 					);
-						CURRENT_PROJECT_VERSION = 38;
+						CURRENT_PROJECT_VERSION = 42;
 						MARKETING_VERSION = 0.9.0;
 				OTHER_LDFLAGS = (
 					"$(inherited)",
@@ -309,7 +309,7 @@
 					"$(inherited)",
 					"@executable_path/../Frameworks",
 					);
-						CURRENT_PROJECT_VERSION = 38;
+						CURRENT_PROJECT_VERSION = 42;
 						MARKETING_VERSION = 0.9.0;
 				OTHER_LDFLAGS = (
 					"$(inherited)",

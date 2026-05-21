@@ -1639,8 +1639,14 @@ final class AppModel: ObservableObject {
     @Published var activeSearchMessageID: String?
     @Published var pendingSearchMessageID: String?
     @Published var pendingScrollEdge: ScrollEdge?
+    var pendingScrollAnimated: Bool = true
 
     enum ScrollEdge { case top, bottom }
+
+    func requestScroll(to edge: ScrollEdge, animated: Bool = true) {
+        pendingScrollAnimated = animated
+        pendingScrollEdge = edge
+    }
 
     private var knownClaudeSessions: [CodexSession] = []
     private var loadTask: Task<Void, Never>?
@@ -1896,6 +1902,7 @@ final class AppModel: ObservableObject {
                 }
                 self?.apply(snapshot)
                 self?.isLoading = false
+                self?.requestScroll(to: .bottom, animated: false)
             } catch is CancellationError {
             } catch {
                 guard !Task.isCancelled else {
@@ -2529,6 +2536,56 @@ struct SessionListView: View {
 struct ConversationView: View {
     @ObservedObject var model: AppModel
 
+    private func performPendingScroll(proxy: ScrollViewProxy) {
+        guard let edge = model.pendingScrollEdge else { return }
+        let animated = model.pendingScrollAnimated
+        let groups = model.visibleQueryGroups
+        guard !groups.isEmpty else { return }
+        let targetID = edge == .top ? groups.first!.id : groups.last!.id
+        let anchor: UnitPoint = edge == .top ? .top : .bottom
+        model.pendingScrollEdge = nil
+        let scroll = {
+            if animated {
+                withAnimation(.easeOut(duration: 0.25)) {
+                    proxy.scrollTo(targetID, anchor: anchor)
+                }
+            } else {
+                proxy.scrollTo(targetID, anchor: anchor)
+            }
+        }
+        Task { @MainActor in
+            try? await Task.sleep(for: .milliseconds(16))
+            scroll()
+            if edge == .bottom {
+                try? await Task.sleep(for: .milliseconds(80))
+                proxy.scrollTo(targetID, anchor: anchor)
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var scrollBody: some View {
+        if model.visibleQueryGroups.isEmpty {
+            if model.isLoading {
+                ProgressView("Loading conversation...")
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else {
+                ContentUnavailableView("No Queries", systemImage: "text.bubble")
+            }
+        } else {
+            ScrollView {
+                LazyVStack(alignment: .leading, spacing: 18) {
+                    ForEach(model.visibleQueryGroups) { group in
+                        QueryGroupView(group: group, model: model)
+                            .id(group.id)
+                    }
+                }
+                .padding(24)
+                .frame(maxWidth: .infinity, alignment: .leading)
+            }
+        }
+    }
+
     var body: some View {
         VStack(spacing: 0) {
             if model.isSearching {
@@ -2537,60 +2594,40 @@ struct ConversationView: View {
             }
             header
             Divider()
-            if model.visibleQueryGroups.isEmpty {
-                if model.isLoading {
-                    ProgressView("Loading conversation...")
-                        .frame(maxWidth: .infinity, maxHeight: .infinity)
-                } else {
-                    ContentUnavailableView("No Queries", systemImage: "text.bubble")
+            ScrollViewReader { proxy in
+                scrollBody
+                .onChange(of: model.visibleQueryGroups.map(\.id)) { _, _ in
+                    // Groups just populated (e.g. session opened from sidebar):
+                    // honour any pending scroll request that was set before the
+                    // ScrollView existed.
+                    guard model.pendingScrollEdge != nil else { return }
+                    performPendingScroll(proxy: proxy)
                 }
-            } else {
-                ScrollViewReader { proxy in
-                    ScrollView {
-                        LazyVStack(alignment: .leading, spacing: 18) {
-                            ForEach(model.visibleQueryGroups) { group in
-                                QueryGroupView(group: group, model: model)
-                                    .id(group.id)
-                            }
-                        }
-                        .padding(24)
-                        .frame(maxWidth: .infinity, alignment: .leading)
+                .onChange(of: model.pendingScrollEdge) { _, edge in
+                    guard edge != nil else { return }
+                    performPendingScroll(proxy: proxy)
+                }
+                .onChange(of: model.pendingSearchMessageID) { _, messageID in
+                    guard let messageID else {
+                        return
                     }
-                    .onChange(of: model.pendingScrollEdge) { _, edge in
-                        guard let edge else { return }
-                        let groups = model.visibleQueryGroups
-                        guard !groups.isEmpty else {
-                            model.pendingScrollEdge = nil
-                            return
-                        }
-                        let targetID = edge == .top ? groups.first!.id : groups.last!.id
-                        withAnimation(.easeOut(duration: 0.25)) {
-                            proxy.scrollTo(targetID, anchor: .top)
-                        }
-                        model.pendingScrollEdge = nil
-                    }
-                    .onChange(of: model.pendingSearchMessageID) { _, messageID in
-                        guard let messageID else {
-                            return
-                        }
-                        let queryIDs = Set(model.queryGroups.map(\.query.id))
-                        let anchor: UnitPoint = queryIDs.contains(messageID) ? .top : .center
-                        if let groupID = model.activeSearchGroupID, groupID != messageID {
-                            proxy.scrollTo(groupID, anchor: .top)
-                            Task { @MainActor in
-                                try? await Task.sleep(for: .milliseconds(140))
-                                guard model.activeSearchMessageID == messageID else {
-                                    return
-                                }
-                                withAnimation {
-                                    proxy.scrollTo(messageID, anchor: anchor)
-                                }
-                                model.pendingSearchMessageID = nil
+                    let queryIDs = Set(model.queryGroups.map(\.query.id))
+                    let anchor: UnitPoint = queryIDs.contains(messageID) ? .top : .center
+                    if let groupID = model.activeSearchGroupID, groupID != messageID {
+                        proxy.scrollTo(groupID, anchor: .top)
+                        Task { @MainActor in
+                            try? await Task.sleep(for: .milliseconds(140))
+                            guard model.activeSearchMessageID == messageID else {
+                                return
                             }
-                        } else {
-                            proxy.scrollTo(messageID, anchor: anchor)
+                            withAnimation {
+                                proxy.scrollTo(messageID, anchor: anchor)
+                            }
                             model.pendingSearchMessageID = nil
                         }
+                    } else {
+                        proxy.scrollTo(messageID, anchor: anchor)
+                        model.pendingSearchMessageID = nil
                     }
                 }
             }
@@ -2653,14 +2690,14 @@ struct ConversationView: View {
                 Divider()
                     .frame(height: 16)
                 Button {
-                    model.pendingScrollEdge = .top
+                    model.requestScroll(to: .top)
                 } label: {
                     Label("Top", systemImage: "arrow.up.to.line")
                 }
                 .keyboardShortcut(.upArrow, modifiers: .command)
                 .disabled(model.visibleQueryGroups.isEmpty)
                 Button {
-                    model.pendingScrollEdge = .bottom
+                    model.requestScroll(to: .bottom)
                 } label: {
                     Label("End", systemImage: "arrow.down.to.line")
                 }
@@ -2907,7 +2944,7 @@ struct MessageView: View {
     let searchText: String
     let isFocused: Bool
 
-    @State private var isPreviewing: Bool = false
+    @State private var isPreviewing: Bool = true
 
     private var canPreview: Bool {
         item.speaker != "You"
