@@ -1,0 +1,307 @@
+#!/usr/bin/env python3
+"""alog - browse Claude Code session logs in the terminal.
+
+Layout: projects (fzf) -> sessions (fzf) -> rendered conversation (glow/less).
+
+Data source: ~/.claude/projects/<encoded-cwd>/<session-uuid>.jsonl
+Each line is one event. We surface user/assistant messages with timestamps.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Iterable
+
+PROJECTS_DIR = Path.home() / ".claude" / "projects"
+
+
+def decode_project_name(encoded: str) -> str:
+    """Claude encodes cwd by replacing '/' with '-'. We can't reliably reverse,
+    but we can present a readable form by stripping the leading '-' and replacing
+    inner '-' with '/' as a best-effort hint."""
+    s = encoded.lstrip("-")
+    return "/" + s.replace("-", "/")
+
+
+def fmt_ts(ts: str) -> str:
+    try:
+        dt = datetime.fromisoformat(ts.replace("Z", "+00:00")).astimezone()
+        return dt.strftime("%Y-%m-%d %H:%M")
+    except Exception:
+        return ts[:16]
+
+
+@dataclass
+class Msg:
+    role: str          # 'user' | 'assistant' | 'system'
+    ts: str
+    text: str
+
+
+def extract_text(content) -> str:
+    """content may be str or list of blocks."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            t = block.get("type")
+            if t == "text":
+                parts.append(block.get("text", ""))
+            elif t == "tool_use":
+                name = block.get("name", "?")
+                parts.append(f"\n```tool_use {name}\n{json.dumps(block.get('input', {}), ensure_ascii=False, indent=2)}\n```\n")
+            elif t == "tool_result":
+                c = block.get("content")
+                inner = extract_text(c) if c is not None else ""
+                parts.append(f"\n```tool_result\n{inner[:2000]}\n```\n")
+            elif t == "thinking":
+                parts.append(f"\n> [thinking]\n> {block.get('thinking','').replace(chr(10), chr(10)+'> ')}\n")
+        return "".join(parts)
+    return ""
+
+
+def parse_session(path: Path) -> tuple[list[Msg], dict]:
+    """Return (messages, meta). meta has first_ts, last_ts, cwd, summary."""
+    msgs: list[Msg] = []
+    cwd = ""
+    summary = ""
+    first_ts = ""
+    last_ts = ""
+    try:
+        with path.open("r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                t = obj.get("type")
+                ts = obj.get("timestamp", "")
+                if ts:
+                    if not first_ts:
+                        first_ts = ts
+                    last_ts = ts
+                if not cwd and obj.get("cwd"):
+                    cwd = obj["cwd"]
+                if t == "summary" and obj.get("summary"):
+                    summary = obj["summary"]
+                    continue
+                if t in ("user", "assistant"):
+                    if obj.get("isMeta"):
+                        continue
+                    message = obj.get("message", {})
+                    text = extract_text(message.get("content", ""))
+                    if text.strip():
+                        msgs.append(Msg(role=t, ts=ts, text=text))
+    except OSError:
+        pass
+    return msgs, {
+        "first_ts": first_ts,
+        "last_ts": last_ts,
+        "cwd": cwd,
+        "summary": summary,
+    }
+
+
+def list_projects() -> list[tuple[Path, str, int, str]]:
+    """Return [(dir_path, display_name, session_count, latest_mtime_str), ...]."""
+    out = []
+    if not PROJECTS_DIR.exists():
+        return out
+    for p in PROJECTS_DIR.iterdir():
+        if not p.is_dir():
+            continue
+        jsonls = list(p.glob("*.jsonl"))
+        if not jsonls:
+            continue
+        latest = max(j.stat().st_mtime for j in jsonls)
+        out.append((p, decode_project_name(p.name), len(jsonls), latest))
+    out.sort(key=lambda x: x[3], reverse=True)
+    return [(p, name, n, datetime.fromtimestamp(m).strftime("%Y-%m-%d %H:%M")) for p, name, n, m in out]
+
+
+def fzf_select(items: list[str], preview_cmd: str | None = None, header: str = "") -> str | None:
+    if not shutil.which("fzf"):
+        sys.stderr.write("fzf not found. brew install fzf\n")
+        sys.exit(1)
+    args = ["fzf", "--ansi", "--height=90%", "--layout=reverse", "--border"]
+    if header:
+        args += ["--header", header]
+    if preview_cmd:
+        args += ["--preview", preview_cmd, "--preview-window=right:60%:wrap"]
+    p = subprocess.run(args, input="\n".join(items), text=True, capture_output=True)
+    if p.returncode != 0:
+        return None
+    return p.stdout.strip() or None
+
+
+def render_session_markdown(path: Path) -> str:
+    msgs, meta = parse_session(path)
+    lines = []
+    title = meta["summary"] or path.stem
+    lines.append(f"# {title}")
+    lines.append("")
+    lines.append(f"- cwd: `{meta['cwd']}`")
+    lines.append(f"- start: {fmt_ts(meta['first_ts'])}  end: {fmt_ts(meta['last_ts'])}")
+    lines.append(f"- messages: {len(msgs)}")
+    lines.append(f"- file: `{path}`")
+    lines.append("")
+    lines.append("---")
+    lines.append("")
+    for m in msgs:
+        tag = "🧑 **User**" if m.role == "user" else "🤖 **Assistant**"
+        lines.append(f"### {tag} · {fmt_ts(m.ts)}")
+        lines.append("")
+        lines.append(m.text.rstrip())
+        lines.append("")
+        lines.append("---")
+        lines.append("")
+    return "\n".join(lines)
+
+
+def view_session(path: Path, renderer: str = "glow") -> None:
+    md = render_session_markdown(path)
+    with tempfile.NamedTemporaryFile("w", suffix=".md", delete=False, encoding="utf-8") as f:
+        f.write(md)
+        tmp = f.name
+    try:
+        if renderer == "glow" and shutil.which("glow"):
+            subprocess.run(["glow", "-p", tmp])
+        elif renderer == "bat" and shutil.which("bat"):
+            subprocess.run(["bat", "--paging=always", "--language=md", tmp])
+        else:
+            subprocess.run(["less", "-R", tmp])
+    finally:
+        os.unlink(tmp)
+
+
+def preview_session(path: Path) -> str:
+    msgs, meta = parse_session(path)
+    out = []
+    out.append(f"summary: {meta['summary'] or '(none)'}")
+    out.append(f"cwd:     {meta['cwd']}")
+    out.append(f"range:   {fmt_ts(meta['first_ts'])} -> {fmt_ts(meta['last_ts'])}")
+    out.append(f"msgs:    {len(msgs)}")
+    out.append("")
+    for m in msgs[:8]:
+        head = m.text.strip().splitlines()[0] if m.text.strip() else ""
+        out.append(f"[{m.role[:1].upper()}] {head[:120]}")
+    return "\n".join(out)
+
+
+# --- CLI entry points ----------------------------------------------------
+
+def cmd_browse(args):
+    projs = list_projects()
+    if not projs:
+        print("No Claude Code projects found in ~/.claude/projects")
+        return 1
+
+    # Project picker
+    proj_lines = [f"{name}\t{n} sessions\t(last {mt})\t{p}"
+                  for p, name, n, mt in projs]
+    sel = fzf_select(proj_lines, header="select project (Enter) / Esc to quit")
+    if not sel:
+        return 0
+    proj_path = Path(sel.split("\t")[-1])
+
+    return _pick_session_in(proj_path)
+
+
+def _pick_session_in(proj_path: Path) -> int:
+    jsonls = sorted(proj_path.glob("*.jsonl"), key=lambda p: p.stat().st_mtime, reverse=True)
+    if not jsonls:
+        print("No sessions in this project.")
+        return 1
+
+    # Build lines: <mtime>\t<msg_count>\t<summary>\t<path>
+    lines = []
+    for j in jsonls:
+        msgs, meta = parse_session(j)
+        when = fmt_ts(meta["last_ts"]) or datetime.fromtimestamp(j.stat().st_mtime).strftime("%Y-%m-%d %H:%M")
+        summary = meta["summary"] or "(no summary)"
+        lines.append(f"{when}\t{len(msgs):>4} msgs\t{summary[:80]}\t{j}")
+
+    script = Path(__file__).resolve()
+    preview_cmd = f"{sys.executable} {script} _preview {{4}}"
+    sel = fzf_select(lines, preview_cmd=preview_cmd,
+                     header="select session (Enter to view) / Esc to quit")
+    if not sel:
+        return 0
+    path = Path(sel.split("\t")[-1])
+    view_session(path)
+    return 0
+
+
+def cmd_preview(args):
+    print(preview_session(Path(args.path)))
+
+
+def cmd_view(args):
+    view_session(Path(args.path), renderer=args.renderer)
+
+
+def cmd_search(args):
+    """Cross-session ripgrep search."""
+    if not shutil.which("rg"):
+        sys.stderr.write("ripgrep (rg) required\n")
+        return 1
+    rg = subprocess.run(
+        ["rg", "--no-heading", "-n", "-i", args.query, str(PROJECTS_DIR)],
+        capture_output=True, text=True,
+    )
+    if not rg.stdout.strip():
+        print("No matches.")
+        return 0
+    # rg output: path:line:content. Pipe into fzf, on enter open session.
+    sel = fzf_select(rg.stdout.strip().splitlines(),
+                     header=f"matches for: {args.query}")
+    if not sel:
+        return 0
+    path = Path(sel.split(":", 1)[0])
+    view_session(path)
+    return 0
+
+
+def main():
+    ap = argparse.ArgumentParser(prog="alog",
+        description="Browse Claude Code session logs in the terminal.")
+    sub = ap.add_subparsers(dest="cmd")
+
+    sub.add_parser("browse", help="(default) pick project -> session -> view")
+
+    p_view = sub.add_parser("view", help="render one session file")
+    p_view.add_argument("path")
+    p_view.add_argument("--renderer", default="glow", choices=["glow", "bat", "less"])
+
+    p_search = sub.add_parser("search", help="ripgrep across all sessions")
+    p_search.add_argument("query")
+
+    p_prev = sub.add_parser("_preview", help=argparse.SUPPRESS)
+    p_prev.add_argument("path")
+
+    args = ap.parse_args()
+    cmd = args.cmd or "browse"
+    return {
+        "browse": cmd_browse,
+        "view": cmd_view,
+        "search": cmd_search,
+        "_preview": cmd_preview,
+    }[cmd](args)
+
+
+if __name__ == "__main__":
+    sys.exit(main() or 0)
