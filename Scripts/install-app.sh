@@ -4,11 +4,6 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 APP_NAME="AgentLog.app"
 APP_PROCESS="AgentLog"
-OLD_APP_PROCESSES=(
-  "AiCliLog"
-  "$(printf "%s %s %s" "AI" "CLI" "Log")"
-  "$(printf "%s %s %s" "Codex" "CLI" "Log")"
-)
 INSTALL_APP="/Applications/$APP_NAME"
 LSREGISTER="/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister"
 
@@ -40,36 +35,17 @@ quit_if_running() {
 }
 
 quit_if_running "$APP_PROCESS"
-for proc in "${OLD_APP_PROCESSES[@]}"; do
-  quit_if_running "$proc"
-done
 
 for _ in {1..30}; do
-  running=0
-  pgrep -x "$APP_PROCESS" >/dev/null && running=1
-  for proc in "${OLD_APP_PROCESSES[@]}"; do
-    pgrep -x "$proc" >/dev/null && running=1
-  done
-  [[ $running -eq 0 ]] && break
+  pgrep -x "$APP_PROCESS" >/dev/null || break
   sleep 0.2
 done
 
-unregister_app() {
-  local path="$1"
-  if [[ -x "$LSREGISTER" && -d "$path" ]]; then
-    "$LSREGISTER" -u "$path" >/dev/null 2>&1 || true
-  fi
-}
-
-unregister_app "$INSTALL_APP"
-for proc in "${OLD_APP_PROCESSES[@]}"; do
-  unregister_app "/Applications/$proc.app"
-done
+if [[ -x "$LSREGISTER" && -d "$INSTALL_APP" ]]; then
+  "$LSREGISTER" -u "$INSTALL_APP" >/dev/null 2>&1 || true
+fi
 
 rm -rf "$INSTALL_APP"
-for proc in "${OLD_APP_PROCESSES[@]}"; do
-  rm -rf "/Applications/$proc.app"
-done
 
 ditto "$DERIVED_APP" "$INSTALL_APP"
 touch "$INSTALL_APP"

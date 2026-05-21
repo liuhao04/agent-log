@@ -7,7 +7,7 @@ import UniformTypeIdentifiers
 
 private let searchLogger = Logger(subsystem: "io.github.agentlog", category: "search")
 
-enum LogSource: String, CaseIterable, Identifiable, Hashable, Sendable {
+enum LogSource: String, CaseIterable, Identifiable, Hashable, Sendable, Codable {
     case codex
     case claude
     case cowork
@@ -26,8 +26,14 @@ enum LogSource: String, CaseIterable, Identifiable, Hashable, Sendable {
     }
 }
 
-struct ProjectSummary: Identifiable, Hashable, Sendable {
-    var id: String { cwd }
+struct ProjectSummary: Identifiable, Hashable, Sendable, Codable {
+    // `projectKey` is the unique grouping key — for Codex it equals `cwd`; for
+    // Claude/Cowork it's the on-disk encoded directory path under
+    // `~/.claude/projects/<encoded>` (so two separate encoded dirs that happen
+    // to hold the same internal `event.cwd` — e.g. after the user migrated a
+    // project — show up as distinct projects).
+    var id: String { projectKey }
+    let projectKey: String
     let cwd: String
     let sessionCount: Int
     let updatedAt: Date
@@ -42,10 +48,11 @@ struct ProjectSummary: Identifiable, Hashable, Sendable {
     }
 }
 
-struct CodexSession: Identifiable, Hashable, Sendable {
-    var id: String { "\(source.rawValue):\(sessionID)" }
+struct CodexSession: Identifiable, Hashable, Sendable, Codable {
+    var id: String { "\(source.rawValue):\(projectKey):\(sessionID)" }
     let sessionID: String
     let source: LogSource
+    let projectKey: String
     let cwd: String
     let title: String
     let transcriptPath: String
@@ -62,7 +69,7 @@ struct CodexSession: Identifiable, Hashable, Sendable {
     }
 }
 
-struct CleanMessage: Identifiable, Hashable, Sendable {
+struct CleanMessage: Identifiable, Hashable, Sendable, Codable {
     let id: String
     let timestamp: Date?
     let speaker: String
@@ -131,7 +138,8 @@ final class CodexStore {
     }
 
     func projects(limit: Int = 100) throws -> [ProjectSummary] {
-        try withDatabase { db in
+        guard isAvailable else { return [] }
+        return try withDatabase { db in
             try rows(
                 db: db,
                 sql: """
@@ -145,6 +153,7 @@ final class CodexStore {
                 bind: { sqlite3_bind_int($0, 1, Int32(limit)) }
             ) { stmt in
                 ProjectSummary(
+                    projectKey: columnText(stmt, 0),
                     cwd: columnText(stmt, 0),
                     sessionCount: Int(sqlite3_column_int(stmt, 1)),
                     updatedAt: dateFromUnix(stmt, 2),
@@ -155,7 +164,8 @@ final class CodexStore {
     }
 
     func sessions(cwd: String, limit: Int = 100) throws -> [CodexSession] {
-        try withDatabase { db in
+        guard isAvailable else { return [] }
+        return try withDatabase { db in
             try rows(
                 db: db,
                 sql: """
@@ -173,6 +183,7 @@ final class CodexStore {
                 CodexSession(
                     sessionID: columnText(stmt, 0),
                     source: .codex,
+                    projectKey: columnText(stmt, 1),
                     cwd: columnText(stmt, 1),
                     title: columnText(stmt, 2),
                     transcriptPath: columnText(stmt, 3),
@@ -185,7 +196,8 @@ final class CodexStore {
     }
 
     func allSessions() throws -> [CodexSession] {
-        try withDatabase { db in
+        guard isAvailable else { return [] }
+        return try withDatabase { db in
             try rows(
                 db: db,
                 sql: """
@@ -199,6 +211,7 @@ final class CodexStore {
                 CodexSession(
                     sessionID: columnText(stmt, 0),
                     source: .codex,
+                    projectKey: columnText(stmt, 1),
                     cwd: columnText(stmt, 1),
                     title: columnText(stmt, 2),
                     transcriptPath: columnText(stmt, 3),
@@ -253,21 +266,33 @@ final class CodexStore {
         }
     }
 
+    var isAvailable: Bool {
+        FileManager.default.fileExists(atPath: databasePath)
+    }
+
     private func withDatabase<T>(_ body: (OpaquePointer?) throws -> T) throws -> T {
         guard FileManager.default.fileExists(atPath: databasePath) else {
             throw CodexStoreError.databaseMissing(databasePath)
         }
 
+        // Open as immutable read-only via URI so we never touch the user's
+        // Codex sqlite WAL/SHM sidecars or contend for locks with a running
+        // Codex CLI process.
+        let escaped = databasePath
+            .replacingOccurrences(of: "%", with: "%25")
+            .replacingOccurrences(of: "?", with: "%3f")
+            .replacingOccurrences(of: "#", with: "%23")
+        let uri = "file:\(escaped)?immutable=1"
+
         var db: OpaquePointer?
-        let flags = SQLITE_OPEN_READWRITE | SQLITE_OPEN_FULLMUTEX
-        guard sqlite3_open_v2(databasePath, &db, flags, nil) == SQLITE_OK else {
+        let flags = SQLITE_OPEN_READONLY | SQLITE_OPEN_FULLMUTEX | SQLITE_OPEN_URI
+        guard sqlite3_open_v2(uri, &db, flags, nil) == SQLITE_OK else {
             let message = db.flatMap { sqlite3_errmsg($0) }.map { String(cString: $0) } ?? "unknown error"
             if db != nil { sqlite3_close(db) }
             throw CodexStoreError.databaseOpenFailed(message)
         }
         defer { sqlite3_close(db) }
         _ = try? execute(db: db, sql: "pragma busy_timeout = 5000", bind: { _ in }, map: { _ in () })
-        _ = try? execute(db: db, sql: "pragma query_only = on", bind: { _ in }, map: { _ in () })
         return try body(db)
     }
 
@@ -324,32 +349,40 @@ final class ClaudeStore {
     }
 
     func projects(from sessions: [CodexSession]) throws -> [ProjectSummary] {
-        var grouped: [String: (count: Int, updatedAt: Date)] = [:]
+        // Group by projectKey (encoded-dir path) so two separate dirs under
+        // `~/.claude/projects/` that happen to share `event.cwd` (e.g. after a
+        // project moved) stay as distinct projects. cwd shown in the row is
+        // the cwd from the session with the latest updatedAt — that's the
+        // closest signal to "where this project actually lives now".
+        var grouped: [String: (count: Int, updatedAt: Date, cwd: String, cwdAt: Date)] = [:]
         for session in sessions {
-            let existing = grouped[session.cwd]
-            grouped[session.cwd] = (
+            let existing = grouped[session.projectKey]
+            let useNewCwd = (existing?.cwdAt ?? .distantPast) < session.updatedAt
+            grouped[session.projectKey] = (
                 count: (existing?.count ?? 0) + 1,
-                updatedAt: max(existing?.updatedAt ?? .distantPast, session.updatedAt)
+                updatedAt: max(existing?.updatedAt ?? .distantPast, session.updatedAt),
+                cwd: useNewCwd ? session.cwd : (existing?.cwd ?? session.cwd),
+                cwdAt: useNewCwd ? session.updatedAt : (existing?.cwdAt ?? session.updatedAt)
             )
         }
-        return grouped.map { cwd, value in
-            ProjectSummary(cwd: cwd, sessionCount: value.count, updatedAt: value.updatedAt, sources: [.claude])
+        return grouped.map { key, value in
+            ProjectSummary(projectKey: key, cwd: value.cwd, sessionCount: value.count, updatedAt: value.updatedAt, sources: [.claude])
         }
         .sorted { left, right in
             if left.updatedAt == right.updatedAt {
-                return left.cwd < right.cwd
+                return left.projectKey < right.projectKey
             }
             return left.updatedAt > right.updatedAt
         }
     }
 
-    func sessions(cwd: String) throws -> [CodexSession] {
-        try sessions(cwd: cwd, from: allSessions())
+    func sessions(projectKey: String) throws -> [CodexSession] {
+        try sessions(projectKey: projectKey, from: allSessions())
     }
 
-    func sessions(cwd: String, from sessions: [CodexSession]) throws -> [CodexSession] {
+    func sessions(projectKey: String, from sessions: [CodexSession]) throws -> [CodexSession] {
         sessions
-            .filter { $0.cwd == cwd }
+            .filter { $0.projectKey == projectKey }
             .sorted { left, right in
                 if left.updatedAt == right.updatedAt {
                     return left.sessionID > right.sessionID
@@ -358,7 +391,7 @@ final class ClaudeStore {
             }
     }
 
-    func allSessions() throws -> [CodexSession] {
+    func allSessions(cacheOnly: Bool = false) throws -> [CodexSession] {
         var sessions: [CodexSession] = []
         let cache = ClaudeSummaryCache.shared
         var seenPaths: Set<String> = []
@@ -372,11 +405,18 @@ final class ClaudeStore {
                 if let session = cached { sessions.append(session) }
                 continue
             }
+            if cacheOnly {
+                // Skip files we'd need to parse from disk; the follow-up
+                // full-pass load() will pick them up.
+                continue
+            }
             let session = sessionSummary(for: file)
             cache.store(path: file.path, mtime: mtime, size: size, session: session)
             if let session { sessions.append(session) }
         }
-        cache.evict(keeping: seenPaths)
+        if !cacheOnly {
+            cache.evict(scopePrefix: projectsPath.path, keeping: seenPaths)
+        }
         return sessions
     }
 
@@ -452,7 +492,11 @@ final class ClaudeStore {
             else {
                 continue
             }
-            cwd = cwd ?? event.cwd
+            // Take the LATEST non-nil cwd, not the first. The suffix scan reads
+            // the tail of the file, so this ends up reflecting where the user
+            // most recently resumed this session — which is the closest thing
+            // to "the project's current real directory".
+            if let c = event.cwd { cwd = c }
             sessionID = event.sessionId ?? sessionID
             if gitBranch.isEmpty {
                 gitBranch = event.gitBranch ?? ""
@@ -477,15 +521,29 @@ final class ClaudeStore {
             }
         }
 
+        // The prefix+suffix scan misses any rename system-reminder that lives
+        // in the middle of a large session. Sweep the whole file when there's
+        // a gap so a mid-session rename still wins over firstQueryTitle.
+        let fileSize = (try? FileManager.default.attributesOfItem(atPath: url.path)[.size] as? NSNumber)?.intValue ?? 0
+        if fileSize > 2 * summaryReadLimit, let fullRename = findLastClaudeRenameTitle(url) {
+            renameTitle = fullRename
+        }
+
         let title = renameTitle ?? firstQueryTitle
 
         guard let cwd else {
             return nil
         }
 
+        // projectKey = the encoded directory's full path on disk. Two distinct
+        // encoded dirs (e.g. after a project moved between locations) stay
+        // separate projects even when their internal `event.cwd` matches.
+        let projectKey = url.deletingLastPathComponent().path
+
         return CodexSession(
             sessionID: sessionID,
             source: .claude,
+            projectKey: projectKey,
             cwd: cwd,
             title: String((title ?? sessionID).prefix(120)),
             transcriptPath: url.path,
@@ -493,6 +551,48 @@ final class ClaudeStore {
             model: "Claude Code",
             gitBranch: gitBranch
         )
+    }
+
+    private func findLastClaudeRenameTitle(_ url: URL) -> String? {
+        guard let handle = try? FileHandle(forReadingFrom: url) else { return nil }
+        defer { try? handle.close() }
+        let chunkSize = 256 * 1024
+        var carry = Data()
+        var last: String?
+        let decoder = JSONDecoder()
+
+        func scan(line: String) {
+            // The raw JSONL line escapes quotes inside the content string,
+            // so we must JSON-decode the event before running the rename regex.
+            guard line.contains("named this session"),
+                  let data = line.data(using: .utf8),
+                  let event = try? decoder.decode(ClaudeEvent.self, from: data),
+                  event.type == "user",
+                  let message = cleanClaudeMessage(event.message?.content),
+                  let title = extractClaudeRenameTitle(message)
+            else { return }
+            last = title
+        }
+
+        while let data = try? handle.read(upToCount: chunkSize), !data.isEmpty {
+            var buf = carry
+            buf.append(data)
+            guard let lastNLIdx = buf.lastIndex(of: 0x0A) else {
+                carry = buf
+                continue
+            }
+            let head = buf.subdata(in: 0..<(lastNLIdx + 1))
+            carry = buf.subdata(in: (lastNLIdx + 1)..<buf.count)
+            if let text = String(data: head, encoding: .utf8) {
+                for line in text.split(separator: "\n", omittingEmptySubsequences: true) {
+                    scan(line: String(line))
+                }
+            }
+        }
+        if !carry.isEmpty, let text = String(data: carry, encoding: .utf8) {
+            scan(line: text)
+        }
+        return last
     }
 
     private func readSummaryPrefix(_ url: URL) -> String? {
@@ -557,28 +657,33 @@ final class CoworkStore {
     }
 
     func projects(from sessions: [CodexSession]) -> [ProjectSummary] {
-        var grouped: [String: (count: Int, updatedAt: Date)] = [:]
+        // cwd resolution uses the latest session — see ClaudeStore.projects for
+        // the rationale (post-mv jsonls can have stale internal cwd).
+        var grouped: [String: (count: Int, updatedAt: Date, cwd: String, cwdAt: Date)] = [:]
         for session in sessions {
-            let existing = grouped[session.cwd]
-            grouped[session.cwd] = (
+            let existing = grouped[session.projectKey]
+            let useNewCwd = (existing?.cwdAt ?? .distantPast) < session.updatedAt
+            grouped[session.projectKey] = (
                 count: (existing?.count ?? 0) + 1,
-                updatedAt: max(existing?.updatedAt ?? .distantPast, session.updatedAt)
+                updatedAt: max(existing?.updatedAt ?? .distantPast, session.updatedAt),
+                cwd: useNewCwd ? session.cwd : (existing?.cwd ?? session.cwd),
+                cwdAt: useNewCwd ? session.updatedAt : (existing?.cwdAt ?? session.updatedAt)
             )
         }
-        return grouped.map { cwd, value in
-            ProjectSummary(cwd: cwd, sessionCount: value.count, updatedAt: value.updatedAt, sources: [.cowork])
+        return grouped.map { key, value in
+            ProjectSummary(projectKey: key, cwd: value.cwd, sessionCount: value.count, updatedAt: value.updatedAt, sources: [.cowork])
         }
         .sorted { left, right in
             if left.updatedAt == right.updatedAt {
-                return left.cwd < right.cwd
+                return left.projectKey < right.projectKey
             }
             return left.updatedAt > right.updatedAt
         }
     }
 
-    func sessions(cwd: String, from sessions: [CodexSession]) -> [CodexSession] {
+    func sessions(projectKey: String, from sessions: [CodexSession]) -> [CodexSession] {
         sessions
-            .filter { $0.cwd == cwd }
+            .filter { $0.projectKey == projectKey }
             .sorted { left, right in
                 if left.updatedAt == right.updatedAt {
                     return left.sessionID > right.sessionID
@@ -587,7 +692,7 @@ final class CoworkStore {
             }
     }
 
-    func allSessions() throws -> [CodexSession] {
+    func allSessions(cacheOnly: Bool = false) throws -> [CodexSession] {
         let fileManager = FileManager.default
         guard fileManager.fileExists(atPath: sessionsRoot.path) else {
             return []
@@ -595,6 +700,8 @@ final class CoworkStore {
 
         var results: [CodexSession] = []
         let decoder = JSONDecoder()
+        let cache = ClaudeSummaryCache.shared
+        var seenPaths: Set<String> = []
 
         // Layout: <root>/<userId>/<workspaceId>/local_<sessionId>.json
         let userDirs = (try? fileManager.contentsOfDirectory(at: sessionsRoot, includingPropertiesForKeys: nil, options: [.skipsHiddenFiles])) ?? []
@@ -617,16 +724,30 @@ final class CoworkStore {
                           !entry.lastPathComponent.hasSuffix(".json.bak")
                     else { continue }
 
+                    seenPaths.insert(entry.path)
+                    let attrs = try? fileManager.attributesOfItem(atPath: entry.path)
+                    let mtime = (attrs?[.modificationDate] as? Date) ?? .distantPast
+                    let size = (attrs?[.size] as? NSNumber)?.int64Value ?? 0
+                    if let cached = cache.lookup(path: entry.path, mtime: mtime, size: size) {
+                        if let session = cached { results.append(session) }
+                        continue
+                    }
+                    if cacheOnly { continue }
+
                     guard let data = try? Data(contentsOf: entry),
                           let sidecar = try? decoder.decode(CoworkSidecar.self, from: data),
                           let cliSessionId = sidecar.cliSessionId, !cliSessionId.isEmpty
-                    else { continue }
+                    else {
+                        cache.store(path: entry.path, mtime: mtime, size: size, session: nil)
+                        continue
+                    }
 
                     // Inner session directory holds the JSONL transcript under .claude/projects/<encoded>/<cliSessionId>.jsonl
                     let innerDirName = entry.deletingPathExtension().lastPathComponent
                     let innerDir = workspaceDir.appendingPathComponent(innerDirName, isDirectory: true)
                     let projectsDir = innerDir.appendingPathComponent(".claude/projects", isDirectory: true)
                     guard let transcriptURL = locateTranscript(in: projectsDir, cliSessionId: cliSessionId) else {
+                        cache.store(path: entry.path, mtime: mtime, size: size, session: nil)
                         continue
                     }
 
@@ -639,18 +760,31 @@ final class CoworkStore {
                         ?? cliSessionId
                     let model = (sidecar.model?.isEmpty == false ? sidecar.model! : "Claude Cowork")
 
-                    results.append(CodexSession(
+                    // projectKey = the inner .claude/projects/<encoded> dir
+                    // path, mirroring ClaudeStore. Each cowork session lives in
+                    // its own innerDir though, so projectKey is effectively
+                    // unique per-cowork-session unless multiple sessions share
+                    // the same workspace path.
+                    let projectKey = transcriptURL.deletingLastPathComponent().path
+
+                    let session = CodexSession(
                         sessionID: cliSessionId,
                         source: .cowork,
+                        projectKey: projectKey,
                         cwd: cwd,
                         title: String(title.prefix(120)),
                         transcriptPath: transcriptURL.path,
                         updatedAt: updatedAt,
                         model: model,
                         gitBranch: ""
-                    ))
+                    )
+                    cache.store(path: entry.path, mtime: mtime, size: size, session: session)
+                    results.append(session)
                 }
             }
+        }
+        if !cacheOnly {
+            cache.evict(scopePrefix: sessionsRoot.path, keeping: seenPaths)
         }
         return results
     }
@@ -698,39 +832,9 @@ private final class SearchIndexStore {
         return base.appendingPathComponent("AgentLog", isDirectory: true)
     }
 
-    private var aiCliLogSupportDirectory: URL {
-        let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)
-            .first ?? FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support")
-        return base.appendingPathComponent("AiCliLog", isDirectory: true)
-    }
-
-    private var previousSupportDirectory: URL {
-        let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)
-            .first ?? FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support")
-        return base.appendingPathComponent(["AI", "CLI", "Log"].joined(separator: " "), isDirectory: true)
-    }
-
-    private var legacySupportDirectory: URL {
-        let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)
-            .first ?? FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support")
-        return base.appendingPathComponent(["Codex", "CLI", "Log"].joined(separator: " "), isDirectory: true)
-    }
-
     private var databaseURL: URL {
         supportDirectory
             .appendingPathComponent("search-index.sqlite")
-    }
-
-    private var aiCliLogDatabaseURL: URL {
-        aiCliLogSupportDirectory.appendingPathComponent("search-index.sqlite")
-    }
-
-    private var legacyDatabaseURL: URL {
-        legacySupportDirectory.appendingPathComponent("search-index.sqlite")
-    }
-
-    private var previousDatabaseURL: URL {
-        previousSupportDirectory.appendingPathComponent("search-index.sqlite")
     }
 
     func refresh(sessions: [CodexSession]) throws -> SearchIndexSummary {
@@ -769,8 +873,6 @@ private final class SearchIndexStore {
             return ([], false)
         }
 
-        try migrateLegacyDatabaseIfNeeded()
-
         guard FileManager.default.fileExists(atPath: databaseURL.path) else {
             return ([], false)
         }
@@ -778,13 +880,24 @@ private final class SearchIndexStore {
         let db = try openDatabase(createIfNeeded: false)
         defer { sqlite3_close(db) }
 
-        let projectByPath = Dictionary(uniqueKeysWithValues: projects.map { ($0.cwd, $0) })
+        // projectKey isn't stored in the search index schema (would need a
+        // migration). Derive it the same way the stores do: Codex uses cwd,
+        // Claude/Cowork use the transcript file's parent directory.
+        let projectByKey = Dictionary(uniqueKeysWithValues: projects.map { ($0.projectKey, $0) })
         let rows = try searchRows(query: trimmed, limit: limit + 1, db: db)
         let results = rows.map { row -> SearchResult in
             let source = LogSource(rawValue: row.source) ?? .codex
+            let projectKey: String
+            switch source {
+            case .codex:
+                projectKey = row.cwd
+            case .claude, .cowork:
+                projectKey = URL(fileURLWithPath: row.transcriptPath).deletingLastPathComponent().path
+            }
             let session = CodexSession(
                 sessionID: row.sessionID,
                 source: source,
+                projectKey: projectKey,
                 cwd: row.cwd,
                 title: row.title,
                 transcriptPath: row.transcriptPath,
@@ -792,7 +905,8 @@ private final class SearchIndexStore {
                 model: row.model,
                 gitBranch: row.gitBranch
             )
-            let project = projectByPath[row.cwd] ?? ProjectSummary(
+            let project = projectByKey[projectKey] ?? ProjectSummary(
+                projectKey: projectKey,
                 cwd: row.cwd,
                 sessionCount: 1,
                 updatedAt: session.updatedAt,
@@ -832,7 +946,6 @@ private final class SearchIndexStore {
     }
 
     private func openDatabase(createIfNeeded: Bool = true) throws -> OpaquePointer? {
-        try migrateLegacyDatabaseIfNeeded()
         if createIfNeeded {
             try FileManager.default.createDirectory(at: databaseURL.deletingLastPathComponent(), withIntermediateDirectories: true)
         }
@@ -850,27 +963,6 @@ private final class SearchIndexStore {
             try? execute(db, "pragma query_only = on")
         }
         return db
-    }
-
-    private func migrateLegacyDatabaseIfNeeded() throws {
-        let fileManager = FileManager.default
-        guard !fileManager.fileExists(atPath: databaseURL.path) else {
-            return
-        }
-        guard let sourceURL = [aiCliLogDatabaseURL, previousDatabaseURL, legacyDatabaseURL].first(where: { fileManager.fileExists(atPath: $0.path) }) else {
-            return
-        }
-
-        try fileManager.createDirectory(at: supportDirectory, withIntermediateDirectories: true)
-        try fileManager.copyItem(at: sourceURL, to: databaseURL)
-
-        for suffix in ["-wal", "-shm"] {
-            let legacySidecar = URL(fileURLWithPath: sourceURL.path + suffix)
-            let sidecar = URL(fileURLWithPath: databaseURL.path + suffix)
-            if fileManager.fileExists(atPath: legacySidecar.path), !fileManager.fileExists(atPath: sidecar.path) {
-                try? fileManager.copyItem(at: legacySidecar, to: sidecar)
-            }
-        }
     }
 
     private func ensureSchema(_ db: OpaquePointer?) throws {
@@ -944,6 +1036,7 @@ private final class SearchIndexStore {
         let indexedSession = CodexSession(
             sessionID: session.sessionID,
             source: session.source,
+            projectKey: session.projectKey,
             cwd: session.cwd,
             title: session.title,
             transcriptPath: url.path,
@@ -1428,7 +1521,7 @@ private func buildQueryGroups(from messages: [CleanMessage]) -> [QueryGroup] {
             id: "\(first.id):meta",
             timestamp: first.timestamp,
             speaker: "System",
-            message: "系统消息 × \(pendingMeta.count)"
+            message: "System messages × \(pendingMeta.count)"
         )
         groups.append(QueryGroup(id: label.id, kind: .meta, query: label, responses: pendingMeta))
         pendingMeta = []
@@ -1468,28 +1561,108 @@ final class ClaudeSummaryCache: @unchecked Sendable {
         let size: Int64
         let session: CodexSession?
     }
+    private struct DiskEntry: Codable {
+        let path: String
+        let mtime: Date
+        let size: Int64
+        let session: CodexSession?
+    }
     private var entries: [String: Entry] = [:]
     private let lock = NSLock()
+    private var didLoad = false
+    private var dirty = false
+    private var saveScheduled = false
+    private static let saveQueue = DispatchQueue(label: "io.github.agentlog.summary-cache.save", qos: .utility)
+
+    private static let diskURL: URL? = {
+        guard let base = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first else {
+            return nil
+        }
+        let dir = base.appendingPathComponent("io.github.agentlog", isDirectory: true)
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        return dir.appendingPathComponent("summary-cache-v1.json")
+    }()
 
     func lookup(path: String, mtime: Date, size: Int64) -> CodexSession?? {
         lock.lock(); defer { lock.unlock() }
-        guard let e = entries[path], e.mtime == mtime, e.size == size else { return nil }
+        loadFromDiskLocked()
+        guard let e = entries[path],
+              e.size == size,
+              abs(e.mtime.timeIntervalSince1970 - mtime.timeIntervalSince1970) < 0.001
+        else { return nil }
         return .some(e.session)
     }
 
     func store(path: String, mtime: Date, size: Int64, session: CodexSession?) {
-        lock.lock(); defer { lock.unlock() }
+        lock.lock()
+        loadFromDiskLocked()
         entries[path] = Entry(mtime: mtime, size: size, session: session)
+        dirty = true
+        let shouldSchedule = !saveScheduled
+        if shouldSchedule { saveScheduled = true }
+        lock.unlock()
+        if shouldSchedule { scheduleSave() }
     }
 
-    func evict(keeping paths: Set<String>) {
-        lock.lock(); defer { lock.unlock() }
-        entries = entries.filter { paths.contains($0.key) }
+    func evict(scopePrefix: String, keeping paths: Set<String>) {
+        lock.lock()
+        loadFromDiskLocked()
+        let before = entries.count
+        entries = entries.filter { key, _ in
+            if key.hasPrefix(scopePrefix) {
+                return paths.contains(key)
+            }
+            return true
+        }
+        let changed = entries.count != before
+        if changed { dirty = true }
+        let shouldSchedule = changed && !saveScheduled
+        if shouldSchedule { saveScheduled = true }
+        lock.unlock()
+        if shouldSchedule { scheduleSave() }
     }
 
     func invalidate(path: String) {
-        lock.lock(); defer { lock.unlock() }
-        entries.removeValue(forKey: path)
+        lock.lock()
+        loadFromDiskLocked()
+        let removed = entries.removeValue(forKey: path) != nil
+        if removed { dirty = true }
+        let shouldSchedule = removed && !saveScheduled
+        if shouldSchedule { saveScheduled = true }
+        lock.unlock()
+        if shouldSchedule { scheduleSave() }
+    }
+
+    private func loadFromDiskLocked() {
+        guard !didLoad else { return }
+        didLoad = true
+        guard let url = Self.diskURL,
+              let data = try? Data(contentsOf: url) else { return }
+        let decoder = JSONDecoder()
+        guard let arr = try? decoder.decode([DiskEntry].self, from: data) else { return }
+        for e in arr {
+            entries[e.path] = Entry(mtime: e.mtime, size: e.size, session: e.session)
+        }
+    }
+
+    private func scheduleSave() {
+        Self.saveQueue.asyncAfter(deadline: .now() + 1.5) { [weak self] in
+            self?.flushIfDirty()
+        }
+    }
+
+    private func flushIfDirty() {
+        lock.lock()
+        saveScheduled = false
+        guard dirty, let url = Self.diskURL else { lock.unlock(); return }
+        dirty = false
+        let snapshot = entries.map {
+            DiskEntry(path: $0.key, mtime: $0.value.mtime, size: $0.value.size, session: $0.value.session)
+        }
+        lock.unlock()
+        let encoder = JSONEncoder()
+        guard let data = try? encoder.encode(snapshot) else { return }
+        try? data.write(to: url, options: .atomic)
     }
 }
 
@@ -1547,69 +1720,6 @@ final class FileSystemWatcher {
     deinit { stop() }
 }
 
-final class EventIntervalLogger: @unchecked Sendable {
-    private let url: URL
-    private var lastEventAt: Date?
-    private let lock = NSLock()
-    private let isoFormatter: ISO8601DateFormatter = {
-        let f = ISO8601DateFormatter()
-        f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        return f
-    }()
-
-    init() {
-        let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
-            ?? FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support")
-        let dir = base.appendingPathComponent("AgentLogApp", isDirectory: true)
-        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        self.url = dir.appendingPathComponent("fs-event-intervals.jsonl")
-    }
-
-    func recordEvent(source: String, pathCount: Int, samplePaths: [String] = []) {
-        let now = Date()
-        let interval: Double?
-        lock.lock()
-        if let last = lastEventAt {
-            interval = now.timeIntervalSince(last)
-        } else {
-            interval = nil
-        }
-        lastEventAt = now
-        lock.unlock()
-        append([
-            "ts": isoFormatter.string(from: now),
-            "kind": "event",
-            "source": source,
-            "paths": pathCount,
-            "samplePaths": samplePaths,
-            "intervalSec": interval as Any
-        ])
-    }
-
-    func recordReload(triggerCount: Int, windowSec: Double) {
-        append([
-            "ts": isoFormatter.string(from: Date()),
-            "kind": "reload",
-            "triggerCount": triggerCount,
-            "windowSec": windowSec
-        ])
-    }
-
-    private func append(_ dict: [String: Any]) {
-        guard let data = try? JSONSerialization.data(withJSONObject: dict, options: [.fragmentsAllowed]) else { return }
-        var line = data
-        line.append(0x0A)
-        lock.lock(); defer { lock.unlock() }
-        if let handle = try? FileHandle(forWritingTo: url) {
-            defer { try? handle.close() }
-            _ = try? handle.seekToEnd()
-            try? handle.write(contentsOf: line)
-        } else {
-            try? line.write(to: url, options: .atomic)
-        }
-    }
-}
-
 @MainActor
 final class AppModel: ObservableObject {
     @Published var projects: [ProjectSummary] = []
@@ -1639,13 +1749,38 @@ final class AppModel: ObservableObject {
     @Published var activeSearchMessageID: String?
     @Published var pendingSearchMessageID: String?
     @Published var pendingScrollEdge: ScrollEdge?
+    @Published var pendingScrollGroupID: String?
+    @Published var lastClickedGroupID: String?
     var pendingScrollAnimated: Bool = true
+
+    // Per-project view state: selected session + which queries are expanded.
+    // (Scroll-anchor restore was tried but caused session-switch lag, so it's
+    // currently disabled — the scroll lands at the bottom like a normal
+    // session click. The session + expansion state still survives.)
+    struct ProjectViewState {
+        var sessionID: String?
+        var expandedQueryIDs: Set<String>
+    }
+    private var projectViewStates: [String: ProjectViewState] = [:]
+
+    func captureCurrentProjectState() {
+        guard let key = selectedProject?.projectKey else { return }
+        projectViewStates[key] = ProjectViewState(
+            sessionID: selectedSession?.id,
+            expandedQueryIDs: expandedQueryIDs
+        )
+    }
 
     enum ScrollEdge { case top, bottom }
 
     func requestScroll(to edge: ScrollEdge, animated: Bool = true) {
         pendingScrollAnimated = animated
         pendingScrollEdge = edge
+    }
+
+    func requestScroll(toGroup groupID: String, animated: Bool = true) {
+        pendingScrollAnimated = animated
+        pendingScrollGroupID = groupID
     }
 
     private var knownClaudeSessions: [CodexSession] = []
@@ -1657,13 +1792,12 @@ final class AppModel: ObservableObject {
     private let searchResultLimit = 500
 
     private let fsWatcher = FileSystemWatcher()
-    private let intervalLogger = EventIntervalLogger()
     private var debounceTask: Task<Void, Never>?
     private var pendingChangeCount: Int = 0
     private var watcherStarted = false
     private let debounceWindow: Double = 10.0
 
-    private struct LoadSnapshot: Sendable {
+    private struct LoadSnapshot: Sendable, Codable {
         let projects: [ProjectSummary]
         let selectedProject: ProjectSummary?
         let sessions: [CodexSession]
@@ -1695,11 +1829,11 @@ final class AppModel: ObservableObject {
     var searchProjectOptions: [ProjectSummary] {
         var seen: Set<String> = []
         var options: [ProjectSummary] = []
-        for result in searchResults where !seen.contains(result.project.cwd) {
+        for result in searchResults where !seen.contains(result.project.projectKey) {
             if let selectedSearchSource, result.session.source != selectedSearchSource {
                 continue
             }
-            seen.insert(result.project.cwd)
+            seen.insert(result.project.projectKey)
             options.append(result.project)
         }
         return options
@@ -1710,7 +1844,7 @@ final class AppModel: ObservableObject {
             if let selectedSearchSource, result.session.source != selectedSearchSource {
                 return false
             }
-            if let selectedSearchProjectPath, result.project.cwd != selectedSearchProjectPath {
+            if let selectedSearchProjectPath, result.project.projectKey != selectedSearchProjectPath {
                 return false
             }
             return true
@@ -1720,7 +1854,7 @@ final class AppModel: ObservableObject {
     var searchSourceOptions: [LogSource] {
         LogSource.allCases.filter { source in
             searchResults.contains { result in
-                if let selectedSearchProjectPath, result.project.cwd != selectedSearchProjectPath {
+                if let selectedSearchProjectPath, result.project.projectKey != selectedSearchProjectPath {
                     return false
                 }
                 return result.session.source == source
@@ -1740,11 +1874,23 @@ final class AppModel: ObservableObject {
         messageTask?.cancel()
         searchIndexTask?.cancel()
         isLoading = true
-        let preferredProjectPath = selectedProject?.cwd
+        let preferredProjectPath = selectedProject?.projectKey
         let preferredSessionID = selectedSession?.id
 
         loadTask = Task { [weak self, preferredProjectPath, preferredSessionID] in
             do {
+                // Phase 1: serve from the persisted last-snapshot for an
+                // instant first paint — zero IO beyond a single JSON read.
+                let lastJob = Task.detached(priority: .userInitiated) {
+                    Self.loadLastSnapshot()
+                }
+                if let last = await lastJob.value, !Task.isCancelled, !last.projects.isEmpty {
+                    self?.apply(last)
+                    self?.isLoading = false
+                }
+
+                // Phase 2: full scan — fills in new/changed files and evicts
+                // stale cache entries.
                 let job = Task.detached(priority: .userInitiated) {
                     try Self.loadSnapshot(
                         preferredProjectPath: preferredProjectPath,
@@ -1764,6 +1910,9 @@ final class AppModel: ObservableObject {
                 self?.isLoading = false
                 self?.refreshSearchIndexInBackground()
                 self?.updateSearchResults()
+                Task.detached(priority: .background) {
+                    Self.saveLastSnapshot(snapshot)
+                }
             } catch is CancellationError {
             } catch {
                 guard !Task.isCancelled else {
@@ -1790,29 +1939,11 @@ final class AppModel: ObservableObject {
     }
 
     private func handleFileSystemChange(paths: [String]) {
-        intervalLogger.recordEvent(
-            source: "raw",
-            pathCount: paths.count,
-            samplePaths: Array(paths.prefix(10))
-        )
         // Only `.jsonl` log files matter. FSEvents on the watched directories
         // also fire for `.DS_Store`, lockfiles, directory mtime bumps, etc.
         // — those should not trigger a reload that jumps the user's selection.
         let logPaths = paths.filter { $0.hasSuffix(".jsonl") }
         guard !logPaths.isEmpty else { return }
-        let source: String
-        if logPaths.contains(where: { $0.contains("/.codex") }) && logPaths.contains(where: { $0.contains("/.claude/") }) {
-            source = "mixed"
-        } else if logPaths.contains(where: { $0.contains("/.codex") }) {
-            source = "codex"
-        } else {
-            source = "claude"
-        }
-        intervalLogger.recordEvent(
-            source: source,
-            pathCount: logPaths.count,
-            samplePaths: Array(logPaths.prefix(5))
-        )
         for path in logPaths {
             ClaudeSummaryCache.shared.invalidate(path: path)
         }
@@ -1828,15 +1959,17 @@ final class AppModel: ObservableObject {
             guard !Task.isCancelled else { return }
             await MainActor.run {
                 guard let self else { return }
-                let count = self.pendingChangeCount
                 self.pendingChangeCount = 0
-                self.intervalLogger.recordReload(triggerCount: count, windowSec: window)
                 self.load()
             }
         }
     }
 
     func loadSessions(for project: ProjectSummary) {
+        // Snapshot the project we're leaving so we can rehydrate it later.
+        captureCurrentProjectState()
+        let restoring = projectViewStates[project.projectKey]
+
         sessionTask?.cancel()
         messageTask?.cancel()
         selectedProject = project
@@ -1847,13 +1980,14 @@ final class AppModel: ObservableObject {
         clearActiveSearchTarget()
         isLoading = true
         let cachedClaudeSessions = knownClaudeSessions
+        let preferredSessionID = restoring?.sessionID
 
-        sessionTask = Task { [weak self, project] in
+        sessionTask = Task { [weak self, project, preferredSessionID, restoring] in
             do {
                 let job = Task.detached(priority: .userInitiated) {
                     try Self.sessionSnapshot(
                         project: project,
-                        preferredSessionID: nil,
+                        preferredSessionID: preferredSessionID,
                         includeClaude: true,
                         knownClaudeSessions: cachedClaudeSessions
                     )
@@ -1867,7 +2001,17 @@ final class AppModel: ObservableObject {
                     return
                 }
                 self?.apply(snapshot)
+                // Restore expanded queries only when the cached session still
+                // resolves to the same session id (otherwise the ids are stale).
+                let matched = restoring?.sessionID != nil
+                    && restoring?.sessionID == snapshot.selectedSession?.id
+                if matched, let cachedExpanded = restoring?.expandedQueryIDs {
+                    self?.expandedQueryIDs = cachedExpanded
+                }
                 self?.isLoading = false
+                // Land at the latest turn like a normal session click.
+                self?.requestScroll(to: .bottom, animated: false)
+                _ = matched
             } catch is CancellationError {
             } catch {
                 guard !Task.isCancelled else {
@@ -1960,7 +2104,7 @@ final class AppModel: ObservableObject {
                 self?.searchResults = response.results
                 self?.searchResultLimitHit = response.limitHit
                 if let selected = self?.selectedSearchProjectPath,
-                   !response.results.contains(where: { $0.project.cwd == selected }) {
+                   !response.results.contains(where: { $0.project.projectKey == selected }) {
                     self?.selectedSearchProjectPath = nil
                 }
                 if let selected = self?.selectedSearchSource,
@@ -1982,7 +2126,7 @@ final class AppModel: ObservableObject {
     func selectSearchResult(_ result: SearchResult) {
         sessionTask?.cancel()
         messageTask?.cancel()
-        let project = projects.first { $0.cwd == result.project.cwd } ?? result.project
+        let project = projects.first { $0.projectKey == result.project.projectKey } ?? result.project
         selectedProject = project
         selectedSession = result.session
         messages = []
@@ -2075,7 +2219,8 @@ final class AppModel: ObservableObject {
     private nonisolated static func loadSnapshot(
         preferredProjectPath: String?,
         preferredSessionID: String?,
-        includeClaude: Bool
+        includeClaude: Bool,
+        cacheOnly: Bool = false
     ) throws -> LoadSnapshot {
         try Task.checkCancellation()
         let store = CodexStore()
@@ -2083,16 +2228,16 @@ final class AppModel: ObservableObject {
         var knownClaudeSessions: [CodexSession] = []
         if includeClaude {
             let claudeStore = ClaudeStore()
-            knownClaudeSessions = try claudeStore.allSessions()
+            knownClaudeSessions = try claudeStore.allSessions(cacheOnly: cacheOnly)
             projectItems += try claudeStore.projects(from: knownClaudeSessions)
             let coworkStore = CoworkStore()
-            let coworkSessions = try coworkStore.allSessions()
+            let coworkSessions = try coworkStore.allSessions(cacheOnly: cacheOnly)
             knownClaudeSessions += coworkSessions
             projectItems += coworkStore.projects(from: coworkSessions)
         }
         let projects = mergedProjects(projectItems)
         try Task.checkCancellation()
-        let selectedProject = projects.first { $0.cwd == preferredProjectPath } ?? projects.first
+        let selectedProject = projects.first { $0.projectKey == preferredProjectPath } ?? projects.first
         guard let selectedProject else {
             return LoadSnapshot(
                 projects: projects,
@@ -2128,7 +2273,7 @@ final class AppModel: ObservableObject {
     ) throws -> SessionSnapshot {
         try Task.checkCancellation()
         let sessions = try projectSessions(
-            cwd: project.cwd,
+            projectKey: project.projectKey,
             includeClaude: includeClaude,
             knownClaudeSessions: knownClaudeSessions
         )
@@ -2153,22 +2298,44 @@ final class AppModel: ObservableObject {
         return MessageSnapshot(session: session, messages: try sessionMessages(for: session))
     }
 
+    private nonisolated static let lastSnapshotURL: URL? = {
+        guard let base = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first else {
+            return nil
+        }
+        let dir = base.appendingPathComponent("io.github.agentlog", isDirectory: true)
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        return dir.appendingPathComponent("last-snapshot-v1.json")
+    }()
+
+    private nonisolated static func loadLastSnapshot() -> LoadSnapshot? {
+        guard let url = lastSnapshotURL,
+              let data = try? Data(contentsOf: url) else { return nil }
+        return try? JSONDecoder().decode(LoadSnapshot.self, from: data)
+    }
+
+    private nonisolated static func saveLastSnapshot(_ snapshot: LoadSnapshot) {
+        guard let url = lastSnapshotURL else { return }
+        guard let data = try? JSONEncoder().encode(snapshot) else { return }
+        try? data.write(to: url, options: .atomic)
+    }
+
     private nonisolated static func projectSessions(
-        cwd: String,
+        projectKey: String,
         includeClaude: Bool,
         knownClaudeSessions: [CodexSession] = []
     ) throws -> [CodexSession] {
         try Task.checkCancellation()
         let store = CodexStore()
-        var sessions = try store.sessions(cwd: cwd)
+        // Codex's projectKey is identical to cwd, so the SQL filter is the same.
+        var sessions = try store.sessions(cwd: projectKey)
         if includeClaude {
             let claudeStore = ClaudeStore()
             if knownClaudeSessions.isEmpty {
-                sessions += try claudeStore.sessions(cwd: cwd)
+                sessions += try claudeStore.sessions(projectKey: projectKey)
                 let coworkSessions = try CoworkStore().allSessions()
-                sessions += CoworkStore().sessions(cwd: cwd, from: coworkSessions)
+                sessions += CoworkStore().sessions(projectKey: projectKey, from: coworkSessions)
             } else {
-                sessions += try claudeStore.sessions(cwd: cwd, from: knownClaudeSessions)
+                sessions += try claudeStore.sessions(projectKey: projectKey, from: knownClaudeSessions)
             }
         }
         try Task.checkCancellation()
@@ -2251,17 +2418,21 @@ final class AppModel: ObservableObject {
     }
 
     private nonisolated static func mergedProjects(_ items: [ProjectSummary]) -> [ProjectSummary] {
-        var grouped: [String: (count: Int, updatedAt: Date, sources: Set<LogSource>)] = [:]
+        // Merge by projectKey so a single cwd that's reachable via multiple
+        // sources (Codex + Claude for the same real cwd) folds into one row,
+        // but two Claude encoded dirs that share a cwd stay separate.
+        var grouped: [String: (count: Int, updatedAt: Date, sources: Set<LogSource>, cwd: String)] = [:]
         for item in items {
-            var existing = grouped[item.cwd] ?? (count: 0, updatedAt: .distantPast, sources: [])
+            var existing = grouped[item.projectKey] ?? (count: 0, updatedAt: .distantPast, sources: [], cwd: item.cwd)
             existing.count += item.sessionCount
             existing.updatedAt = max(existing.updatedAt, item.updatedAt)
             existing.sources.formUnion(item.sources)
-            grouped[item.cwd] = existing
+            grouped[item.projectKey] = existing
         }
-        return grouped.map { cwd, value in
+        return grouped.map { key, value in
             ProjectSummary(
-                cwd: cwd,
+                projectKey: key,
+                cwd: value.cwd,
                 sessionCount: value.count,
                 updatedAt: value.updatedAt,
                 sources: LogSource.allCases.filter { value.sources.contains($0) }
@@ -2607,6 +2778,23 @@ struct ConversationView: View {
                     guard edge != nil else { return }
                     performPendingScroll(proxy: proxy)
                 }
+                .onChange(of: model.pendingScrollGroupID) { _, gid in
+                    guard let gid else { return }
+                    let animated = model.pendingScrollAnimated
+                    model.pendingScrollGroupID = nil
+                    // Defer one tick so the collapsed view has finished its
+                    // layout pass before we re-anchor scroll position.
+                    Task { @MainActor in
+                        try? await Task.sleep(for: .milliseconds(16))
+                        if animated {
+                            withAnimation(.easeOut(duration: 0.2)) {
+                                proxy.scrollTo(gid, anchor: .top)
+                            }
+                        } else {
+                            proxy.scrollTo(gid, anchor: .top)
+                        }
+                    }
+                }
                 .onChange(of: model.pendingSearchMessageID) { _, messageID in
                     guard let messageID else {
                         return
@@ -2751,7 +2939,7 @@ struct SearchResultsView: View {
                     Picker("Project", selection: $model.selectedSearchProjectPath) {
                         Text("All Projects").tag(String?.none)
                         ForEach(model.searchProjectOptions) { project in
-                            Text(project.displayName).tag(Optional(project.cwd))
+                            Text(project.displayName).tag(Optional(project.projectKey))
                         }
                     }
                     .labelsHidden()
@@ -2848,10 +3036,50 @@ struct SearchResultRow: View {
 struct QueryGroupView: View {
     let group: QueryGroup
     @ObservedObject var model: AppModel
+    @State private var isQueryTextExpanded = false
+
+    private var isResponseExpanded: Bool {
+        model.expandedQueryIDs.contains(group.id)
+    }
+
+    private var isLastClicked: Bool {
+        model.lastClickedGroupID == group.id
+    }
+
+    private func markClicked() {
+        model.lastClickedGroupID = group.id
+    }
+
+    private func toggleResponseExpanded() {
+        markClicked()
+        if isResponseExpanded {
+            model.expandedQueryIDs.remove(group.id)
+        } else {
+            model.expandedQueryIDs.insert(group.id)
+        }
+    }
+
+    // Show the "Show more / Show less" toggle when the query text is long
+    // enough to truncate at 5 lines: more than 4 newlines OR over ~300 chars
+    // (catches both multi-line prompts and single long prompts that visually wrap).
+    private var queryTextNeedsTruncation: Bool {
+        let m = group.query.message
+        if m.filter({ $0 == "\n" }).count > 4 { return true }
+        return m.count > 300
+    }
+
+    private func copyQueryToPasteboard() {
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(group.query.message, forType: .string)
+    }
 
     var body: some View {
+        disclosureBody
+    }
+
+    private var disclosureBody: some View {
         DisclosureGroup(isExpanded: Binding(
-            get: { model.expandedQueryIDs.contains(group.id) },
+            get: { isResponseExpanded },
             set: { isExpanded in
                 if isExpanded {
                     model.expandedQueryIDs.insert(group.id)
@@ -2895,21 +3123,82 @@ struct QueryGroupView: View {
                 Text("\(group.responseCount) replies")
                     .font(.caption)
                     .foregroundStyle(.secondary)
+                Image(systemName: isResponseExpanded ? "chevron.up" : "chevron.down")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
             }
-            Text(highlightedString(group.query.message, query: model.trimmedSearchText))
-                .textSelection(.enabled)
-                .font(.body)
-                .lineSpacing(4)
-                .frame(maxWidth: .infinity, alignment: .leading)
+            // NSTextView wrapper: drag inside selects text; a click without
+            // drag falls through to onTap → toggleResponseExpanded.
+            SelectableQueryText(
+                attributed: highlightedString(group.query.message, query: model.trimmedSearchText),
+                maxLines: queryTextNeedsTruncation && !isQueryTextExpanded ? 5 : 0,
+                onTap: { toggleResponseExpanded() }
+            )
+            .frame(maxWidth: .infinity, alignment: .leading)
+            if queryTextNeedsTruncation {
+                Button {
+                    let wasExpanded = isQueryTextExpanded
+                    isQueryTextExpanded.toggle()
+                    markClicked()
+                    // Collapsing shrinks the ScrollView contentSize and can
+                    // leave the current group out of viewport. Re-anchor it.
+                    if wasExpanded {
+                        model.requestScroll(toGroup: group.id)
+                    }
+                } label: {
+                    HStack(spacing: 4) {
+                        Image(systemName: isQueryTextExpanded ? "chevron.up" : "chevron.down")
+                        Text(isQueryTextExpanded ? "Show less" : "Show more")
+                    }
+                    .font(.caption)
+                    .foregroundStyle(.tint)
+                }
+                .buttonStyle(.plain)
+            }
         }
         .padding(14)
         .id(group.query.id)
-        .background(group.id == model.activeSearchGroupID ? Color.yellow.opacity(0.16) : Color.accentColor.opacity(0.10))
+        .background(queryBackgroundColor)
         .clipShape(RoundedRectangle(cornerRadius: 8))
         .overlay(
             RoundedRectangle(cornerRadius: 8)
-                .stroke(group.id == model.activeSearchGroupID ? Color.accentColor : Color(nsColor: .separatorColor), lineWidth: group.id == model.activeSearchGroupID ? 1 : 0.5)
+                .stroke(queryBorderColor, lineWidth: queryBorderWidth)
         )
+        .contentShape(Rectangle())
+        .onTapGesture {
+            toggleResponseExpanded()
+        }
+        .contextMenu {
+            Button("Copy Query") {
+                copyQueryToPasteboard()
+            }
+        }
+    }
+
+    private var queryBackgroundColor: Color {
+        if group.id == model.activeSearchGroupID {
+            return Color.yellow.opacity(0.16)
+        }
+        if isLastClicked {
+            return Color.accentColor.opacity(0.32)
+        }
+        return Color.accentColor.opacity(0.10)
+    }
+
+    private var queryBorderColor: Color {
+        if group.id == model.activeSearchGroupID {
+            return Color.accentColor
+        }
+        if isLastClicked {
+            return Color.accentColor.opacity(0.75)
+        }
+        return Color(nsColor: .separatorColor)
+    }
+
+    private var queryBorderWidth: CGFloat {
+        if group.id == model.activeSearchGroupID { return 1 }
+        if isLastClicked { return 1 }
+        return 0.5
     }
 
     private var metaLabel: some View {
@@ -2936,6 +3225,103 @@ struct QueryGroupView: View {
             RoundedRectangle(cornerRadius: 6)
                 .stroke(Color(nsColor: .separatorColor).opacity(0.5), lineWidth: 0.5)
         )
+    }
+}
+
+// NSTextView-backed selectable label. Renders an AttributedString, supports
+// drag-to-select (native NSTextView behaviour) AND fires `onTap` for a click
+// that did not produce a selection — which SwiftUI's `.textSelection(.enabled)`
+// + `.onTapGesture` combo cannot do because the Text view swallows the click.
+struct SelectableQueryText: NSViewRepresentable {
+    let attributed: AttributedString
+    let maxLines: Int    // 0 = unlimited
+    let onTap: () -> Void
+
+    final class Coordinator {
+        var onTap: () -> Void = {}
+    }
+
+    func makeCoordinator() -> Coordinator { Coordinator() }
+
+    func makeNSView(context: Context) -> TappableTextView {
+        let tv = TappableTextView()
+        tv.isEditable = false
+        tv.isSelectable = true
+        tv.drawsBackground = false
+        tv.backgroundColor = .clear
+        tv.textContainerInset = .zero
+        if let tc = tv.textContainer {
+            tc.lineFragmentPadding = 0
+            tc.widthTracksTextView = true
+        }
+        tv.isVerticallyResizable = true
+        tv.isHorizontallyResizable = false
+        tv.coordinator = context.coordinator
+        tv.font = NSFont.preferredFont(forTextStyle: .body)
+        tv.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        tv.setContentCompressionResistancePriority(.defaultHigh, for: .vertical)
+        return tv
+    }
+
+    func updateNSView(_ tv: TappableTextView, context: Context) {
+        context.coordinator.onTap = onTap
+
+        let base: NSAttributedString
+        if let conv = try? NSAttributedString(attributed, including: \.appKit) {
+            base = conv
+        } else {
+            base = NSAttributedString(string: String(attributed.characters))
+        }
+        let m = NSMutableAttributedString(attributedString: base)
+        let full = NSRange(location: 0, length: m.length)
+        m.enumerateAttribute(.font, in: full) { val, range, _ in
+            if val == nil {
+                m.addAttribute(.font, value: NSFont.preferredFont(forTextStyle: .body), range: range)
+            }
+        }
+        m.enumerateAttribute(.foregroundColor, in: full) { val, range, _ in
+            if val == nil {
+                m.addAttribute(.foregroundColor, value: NSColor.labelColor, range: range)
+            }
+        }
+        let ps = NSMutableParagraphStyle()
+        ps.lineSpacing = 4
+        m.addAttribute(.paragraphStyle, value: ps, range: full)
+        tv.textStorage?.setAttributedString(m)
+        if let tc = tv.textContainer {
+            tc.maximumNumberOfLines = maxLines
+            tc.lineBreakMode = maxLines > 0 ? .byTruncatingTail : .byWordWrapping
+        }
+        tv.invalidateIntrinsicContentSize()
+    }
+}
+
+final class TappableTextView: NSTextView {
+    weak var coordinator: SelectableQueryText.Coordinator?
+
+    override var intrinsicContentSize: NSSize {
+        guard let lm = layoutManager, let tc = textContainer else {
+            return NSSize(width: NSView.noIntrinsicMetric, height: 0)
+        }
+        lm.ensureLayout(for: tc)
+        let used = lm.usedRect(for: tc)
+        return NSSize(width: NSView.noIntrinsicMetric, height: ceil(used.height))
+    }
+
+    override func layout() {
+        super.layout()
+        invalidateIntrinsicContentSize()
+    }
+
+    // NSTextView.mouseDown runs a modal tracking loop until the mouse is released.
+    // When it returns, we can compare selection state to decide tap vs drag-select.
+    override func mouseDown(with event: NSEvent) {
+        let preLen = selectedRange().length
+        super.mouseDown(with: event)
+        let postLen = selectedRange().length
+        if postLen == 0 && preLen == 0 {
+            coordinator?.onTap()
+        }
     }
 }
 
