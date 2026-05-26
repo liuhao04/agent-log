@@ -6,13 +6,14 @@
 #   - Notarization credentials: either a keychain profile (default
 #     `notarize-profile`) OR App Store Connect API Key env vars
 #     (NOTARIZE_API_KEY_ID / NOTARIZE_API_ISSUER_ID / NOTARIZE_API_KEY_PATH).
-#     The script also auto-sources `~/Library/Mobile Documents/com~apple~CloudDocs/Projects/apple-certs/notarize.env`
-#     if present.
+#     The script also auto-sources an env file if present (see NOTARIZE_ENV_FILE).
 #
 # Env overrides:
 #   SIGN_IDENTITY      full name of Developer ID Application cert
 #                      (defaults: first one found in keychain)
 #   NOTARY_PROFILE     keychain profile name (default: notarize-profile)
+#   NOTARIZE_ENV_FILE  path to a shell env file exporting the NOTARIZE_API_*
+#                      vars above (default: ~/.config/apple-certs/notarize.env)
 #   SKIP_NOTARIZE=1    sign + DMG only, skip notarize/staple
 
 set -euo pipefail
@@ -26,16 +27,15 @@ PROJECT="AgentLogApp.xcodeproj"
 NOTARY_PROFILE="${NOTARY_PROFILE:-notarize-profile}"
 
 # Resolve notarize authentication once. Prefer keychain profile; fall back to
-# App Store Connect API Key env vars (auto-sourcing the shared notarize.env
-# from iCloud apple-certs if present).
+# App Store Connect API Key env vars (auto-sourcing a shared env file if present).
 NOTARY_AUTH=()
 if [[ "${SKIP_NOTARIZE:-0}" != "1" ]]; then
   if xcrun notarytool history --keychain-profile "$NOTARY_PROFILE" >/dev/null 2>&1; then
     NOTARY_AUTH=(--keychain-profile "$NOTARY_PROFILE")
     echo "==> Notary auth: keychain profile '$NOTARY_PROFILE'"
   else
-    # Try env file fallback
-    ENV_FILE="$HOME/Library/Mobile Documents/com~apple~CloudDocs/Projects/apple-certs/notarize.env"
+    # Try env file fallback (override location with NOTARIZE_ENV_FILE)
+    ENV_FILE="${NOTARIZE_ENV_FILE:-$HOME/.config/apple-certs/notarize.env}"
     if [[ -z "${NOTARIZE_API_KEY_ID:-}" && -f "$ENV_FILE" ]]; then
       # shellcheck disable=SC1090
       source "$ENV_FILE"
