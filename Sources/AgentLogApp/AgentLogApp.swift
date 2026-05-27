@@ -1720,6 +1720,12 @@ final class FileSystemWatcher {
     deinit { stop() }
 }
 
+enum UpdateCheckResult: Equatable {
+    case upToDate(current: String)
+    case updateAvailable(latest: String, current: String, url: URL)
+    case failed(String)
+}
+
 @MainActor
 final class AppModel: ObservableObject {
     @Published var projects: [ProjectSummary] = []
@@ -1751,6 +1757,8 @@ final class AppModel: ObservableObject {
     @Published var pendingScrollEdge: ScrollEdge?
     @Published var pendingScrollGroupID: String?
     @Published var lastClickedGroupID: String?
+    @Published var updateCheckResult: UpdateCheckResult?
+    @Published var isCheckingForUpdates = false
     var pendingScrollAnimated: Bool = true
 
     // Per-project view state: selected session + which queries are expanded.
@@ -1866,6 +1874,92 @@ final class AppModel: ObservableObject {
         let version = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "0.0.0"
         let build = Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? ""
         return build.isEmpty ? "Version \(version)" : "Version \(version) (\(build))"
+    }
+
+    private var currentAppVersion: String {
+        Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "0.0.0"
+    }
+
+    var updateCheckMessage: String {
+        switch updateCheckResult {
+        case .upToDate(let current):
+            return "You're on the latest version (\(current))."
+        case .updateAvailable(let latest, let current, _):
+            return "AgentLog \(latest) is available. You have \(current)."
+        case .failed(let reason):
+            return "Couldn't check for updates: \(reason)"
+        case .none:
+            return ""
+        }
+    }
+
+    /// Manual update check: always produces user-visible feedback (the user
+    /// explicitly asked), unlike a silent background check.
+    func checkForUpdates() {
+        guard !isCheckingForUpdates else { return }
+        isCheckingForUpdates = true
+        let current = currentAppVersion
+        Task { [weak self] in
+            do {
+                let latest = try await Self.fetchLatestRelease()
+                self?.isCheckingForUpdates = false
+                if Self.isVersion(latest.version, newerThan: current) {
+                    self?.updateCheckResult = .updateAvailable(
+                        latest: latest.version, current: current, url: latest.url
+                    )
+                } else {
+                    self?.updateCheckResult = .upToDate(current: current)
+                }
+            } catch {
+                self?.isCheckingForUpdates = false
+                self?.updateCheckResult = .failed(error.localizedDescription)
+            }
+        }
+    }
+
+    private nonisolated static func fetchLatestRelease() async throws -> (version: String, url: URL) {
+        // Use the github.com web endpoint (302-redirects to the latest tag)
+        // rather than api.github.com. The API caps unauthenticated calls at
+        // 60/hour per IP — shared across everyone behind the same NAT/proxy, so
+        // it's quickly exhausted on corporate/shared networks. The web redirect
+        // has no such limit and needs no token.
+        guard let endpoint = URL(string: "https://github.com/liuhao04/agent-log/releases/latest") else {
+            throw URLError(.badURL)
+        }
+        var request = URLRequest(url: endpoint)
+        request.setValue("AgentLog", forHTTPHeaderField: "User-Agent")
+        request.timeoutInterval = 15
+
+        let (_, response) = try await URLSession.shared.data(for: request)
+        guard let http = response as? HTTPURLResponse else {
+            throw URLError(.badServerResponse)
+        }
+        guard http.statusCode == 200, let finalURL = response.url else {
+            throw NSError(domain: "AgentLog", code: http.statusCode, userInfo: [
+                NSLocalizedDescriptionKey: "GitHub returned HTTP \(http.statusCode)."
+            ])
+        }
+        // After following the redirect, finalURL is …/releases/tag/<tag>.
+        let tag = finalURL.lastPathComponent
+        guard tag != "latest", !tag.isEmpty else {
+            throw NSError(domain: "AgentLog", code: 0, userInfo: [
+                NSLocalizedDescriptionKey: "No published releases found yet."
+            ])
+        }
+        let version = tag.hasPrefix("v") ? String(tag.dropFirst()) : tag
+        return (version, finalURL)
+    }
+
+    /// Numeric, component-wise semantic-version comparison (missing components = 0).
+    private static func isVersion(_ a: String, newerThan b: String) -> Bool {
+        let pa = a.split(separator: ".").map { Int($0) ?? 0 }
+        let pb = b.split(separator: ".").map { Int($0) ?? 0 }
+        for i in 0..<max(pa.count, pb.count) {
+            let x = i < pa.count ? pa[i] : 0
+            let y = i < pb.count ? pb[i] : 0
+            if x != y { return x > y }
+        }
+        return false
     }
 
     func load() {
@@ -2594,6 +2688,19 @@ struct ContentView: View {
             Button("OK", role: .cancel) {}
         } message: {
             Text(model.errorMessage ?? "")
+        }
+        .alert("Check for Updates", isPresented: Binding(
+            get: { model.updateCheckResult != nil },
+            set: { if !$0 { model.updateCheckResult = nil } }
+        )) {
+            if case .updateAvailable(_, _, let url) = model.updateCheckResult {
+                Button("View Release") { NSWorkspace.shared.open(url) }
+                Button("Later", role: .cancel) {}
+            } else {
+                Button("OK", role: .cancel) {}
+            }
+        } message: {
+            Text(model.updateCheckMessage)
         }
     }
 }
@@ -3863,6 +3970,19 @@ struct AgentLogApp: App {
         .windowStyle(.titleBar)
         .commands {
             CommandGroup(replacing: .newItem) {}
+            // Put "Check for Updates…" in the app (AgentLog) menu, right under
+            // About — the macOS-standard spot. On macOS 26, CommandGroup(after:)
+            // doesn't render, but replacing: does, so we rebuild the .appInfo
+            // section (recreating the standard About item) and append our entry.
+            CommandGroup(replacing: .appInfo) {
+                Button("About AgentLog") {
+                    NSApplication.shared.orderFrontStandardAboutPanel(nil)
+                }
+                Button("Check for Updates…") {
+                    model.checkForUpdates()
+                }
+                .disabled(model.isCheckingForUpdates)
+            }
             CommandMenu("Actions") {
                 Button {
                     model.load()
@@ -3876,7 +3996,7 @@ struct AgentLogApp: App {
                 } label: {
                     Label("Search Messages", systemImage: "magnifyingglass")
                 }
-                .keyboardShortcut("f", modifiers: [.command])
+                .keyboardShortcut("f", modifiers: [.command, .option])
             }
         }
 
@@ -3894,6 +4014,15 @@ struct AgentLogApp: App {
             } label: {
                 Label("Restart", systemImage: "arrow.clockwise")
             }
+            Divider()
+            Button {
+                openWindow(id: "main")
+                model.showMainWindow()
+                model.checkForUpdates()
+            } label: {
+                Label("Check for Updates…", systemImage: "arrow.down.circle")
+            }
+            .disabled(model.isCheckingForUpdates)
             Divider()
             Button {
                 NSApp.terminate(nil)
